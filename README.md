@@ -25,38 +25,12 @@ cargo install --path .
 
 ## Usage
 
-1. Create a configuration file (e.g., `config.yml`) with your tasks:
+1. Create a configuration file, run the following to generate a sample configuration file:
 
-```yaml
-logging:
-  output: file  # Options: stdout, file, syslog
-  level: info   # Options: error, warn, info, debug, trace
-  path: /var/log/cron-rs.log  # Required if output is 'file'
-
-tasks:
-  - name: MyTask
-    cmd: echo 'hello'
-    when:
-      day_of_week:
-        - Mon
-        - Thu
-      year: '*'
-      month: '*'
-      day: '*/2'
-      hour: 12
-      minute: 0
-      second: 0
-    timezone: 'Europe/Madrid'  # Optional
-    avoid_overlapping: true    # Optional, prevents concurrent execution
-    working_directory: /path/to/work # Optional, working directory for the task
-    stdout: /path/to/stdout.log # Optional
-    stderr: /path/to/stderr.log # Optional
-    time_limit: 300           # Optional, time limit in seconds
-    env:                      # Optional, environment variables
-      PATH: /usr/local/bin:/usr/bin:/bin
-      HOME: /home/user
-    run_as: www-data         # Optional, run as different user
+```bash
+cron-rs generate-config > config.yml
 ```
+
 
 2. Run the scheduler:
 
