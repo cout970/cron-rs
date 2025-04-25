@@ -10,6 +10,7 @@ A Rust-based task scheduler that allows you to run commands at specified times u
 - Command execution
 - Config validation
 - Configurable logging (stdout, file, or syslog)
+- Concurrent execution prevention
 
 ## Installation
 
@@ -41,6 +42,7 @@ tasks:
       minute: 0
       second: 0
     timezone: 'Europe/Madrid'  # Optional
+    avoid_overlapping: true    # Optional, prevents concurrent execution
 ```
 
 2. Run the scheduler:
@@ -53,6 +55,51 @@ cron-rs --config config.yml
 
 ```bash
 cron-rs --config config.yml --validate
+```
+
+## Task Configuration Options
+
+### Basic Options
+- `name`: Unique identifier for the task
+- `cmd`: Command to execute
+- `timezone`: Timezone for the task (optional, defaults to system timezone)
+- `avoid_overlapping`: Boolean flag to prevent concurrent execution (optional, defaults to false)
+
+### Scheduling Options
+You can use either `when` or `every` to specify when a task should run:
+
+#### Using `when`:
+```yaml
+when:
+  day_of_week: [Mon, Tue, Wed, Thu, Fri, Sat, Sun]
+  year: '*'  # or specific year
+  month: '*' # or specific month
+  day: '*'   # or specific day
+  hour: '*'  # or specific hour
+  minute: '*' # or specific minute
+  second: '*' # or specific second
+```
+
+#### Using `every`:
+```yaml
+every: "5 minutes"  # or "1 hour", "2 days", etc.
+```
+
+## Concurrent Execution Prevention
+
+The `avoid_overlapping` option prevents multiple instances of the same task from running simultaneously. When enabled:
+
+1. The scheduler checks if a previous instance of the task is still running
+2. If a previous instance is found, the new execution is skipped
+3. A warning is logged when execution is skipped due to overlapping
+
+Example:
+```yaml
+tasks:
+  - name: LongRunningTask
+    cmd: sleep 60
+    every: "30 seconds"
+    avoid_overlapping: true  # This task will never run concurrently
 ```
 
 ## Logging Configuration

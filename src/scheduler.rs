@@ -121,17 +121,23 @@ fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTas
             continue;
         }
 
-        // TODO: Implement retries
-        // TODO: Add avoid_overlapping option to Task
-        // if task.config.avoid_overlapping {
-        if let Some(pid) = task.last_pid {
+        if task.config.avoid_overlapping {
             let sys = System::new_all();
-            if sys.process(Pid::from_u32(pid)).is_some() {
-                warn!("Task '{}' is already running (PID: {}). Skipping execution.", task.config.name, pid);
+            if let Some(pid) = task.last_pid {
+                if sys.process(Pid::from_u32(pid)).is_some() {
+                    warn!("Task '{}' is already running (PID: {}). Skipping execution due to avoid_overlapping=true.", 
+                        task.config.name, pid);
+                    continue;
+                }
+            }
+
+            // Check if task is in active_tasks
+            if active_tasks.iter().any(|active| active.config.name == task.config.name) {
+                warn!("Task '{}' is already running. Skipping execution due to avoid_overlapping=true.", 
+                    task.config.name);
                 continue;
             }
         }
-        // }
 
         execute_task(task, now, active_tasks);
     }

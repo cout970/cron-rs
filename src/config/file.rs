@@ -17,6 +17,8 @@ pub struct TaskConfig {
     pub every: Option<String>,
     pub when: Option<TimePatternConfig>,
     pub timezone: Option<String>,
+    #[serde(default)]
+    pub avoid_overlapping: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
