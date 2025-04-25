@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use signal_hook::consts::SIGINT;
 use sysinfo::{Pid, System};
-use crate::config::{Schedule, Task, TimePatternField};
+use crate::config::{Schedule, TaskConfig, TimePatternField};
 use chrono::TimeZone;
 use chrono_tz::Tz;
+use std::path::PathBuf;
 use std::process::Child;
 use sysinfo::ProcessStatus;
 use log::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
 struct PendingTask {
-    config: Task,
+    config: TaskConfig,
     last_execution: Option<Instant>,
     last_pid: Option<u32>,
     retries: u32,
@@ -24,13 +25,13 @@ struct PendingTask {
 
 #[derive(Debug)]
 struct ActiveTask {
-    config: Task,
+    config: TaskConfig,
     pid: u32,
     start_time: Instant,
     child: Child, 
 }
 
-pub fn start_scheduler(tasks: Vec<Task>) -> anyhow::Result<()> {
+pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
     info!("Initializing scheduler with {} tasks", tasks.len());
     
     // Detect CTRL+C to stop the infinite loop
@@ -144,17 +145,30 @@ fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTas
 }
 
 fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<ActiveTask>) {
-    let stdout = match File::create("stdout.log") {
+    let stdout_path = PathBuf::from(task.config.stdout.as_deref().unwrap_or(".tmp/stdout.log"));
+    let stderr_path = PathBuf::from(task.config.stderr.as_deref().unwrap_or(".tmp/stderr.log"));
+
+    if let Some(path) =  stdout_path.parent() {
+        if !path.exists() {
+            std::fs::create_dir_all(path).expect(format!("Failed to create stdout parent directory for task '{}'", task.config.name).as_str());
+        }
+    }
+    if let Some(path) = stderr_path.parent() {
+        if !path.exists() {
+            std::fs::create_dir_all(path).expect(format!("Failed to create stderr parent directory for task '{}'", task.config.name).as_str());
+        }
+    }
+    let stdout = match File::create(&stdout_path) {
         Ok(file) => file,
         Err(e) => {
-            error!("Failed to create stdout.log for task '{}': {}", task.config.name, e);
+            error!("Failed to create {} for task '{}': {}", stdout_path.to_string_lossy(), task.config.name, e);
             return;
         }
     };
-    let stderr = match File::create("stderr.log") {
+    let stderr = match File::create(&stderr_path) {
         Ok(file) => file,
         Err(e) => {
-            error!("Failed to create stderr.log for task '{}': {}", task.config.name, e);
+            error!("Failed to create {} for task '{}': {}", stderr_path.to_string_lossy(), task.config.name, e);
             return;
         }
     };
@@ -163,10 +177,11 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
     cmd.arg("-c");
     cmd.arg(&task.config.cmd);
 
-    // TODO: Add runtime_dir to Task
-    // cmd.current_dir(&task.config.runtime_dir);
+    if let Some(dir) = &task.config.runtime_dir {
+        cmd.current_dir(dir);
+        debug!("Set runtime directory to '{}' for task '{}'", dir, task.config.name);
+    }
 
-    // TODO: Allow to change the stdout and stderr redirection
     cmd.stdout(Stdio::from(stdout));
     cmd.stderr(Stdio::from(stderr));
 

@@ -18,26 +18,29 @@ use chrono::{TimeZone};
 use chrono_tz::{Tz, UTC};
 
 use self::dayofweek::DayOfWeek;
+use self::file::{ConfigFile, ExplodedTimePatternConfig, TaskDefinition, TimePatternConfig};
 use self::file::ExplodedTimePatternFieldConfig;
-use self::file::{ConfigFile, ExplodedTimePatternConfig, TaskConfig, TimePatternConfig};
 use self::timeunit::TimeUnit;
 use self::logging::LoggingConfig;
 
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
-pub struct Config {
-    pub tasks: Vec<Task>,
-    pub logging: LoggingConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct Task {
+pub struct TaskConfig {
     pub name: String,
     pub cmd: String,
     pub timezone: Tz,
     pub schedule: Schedule,
     pub avoid_overlapping: bool,
+    pub runtime_dir: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub tasks: Vec<TaskConfig>,
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -69,10 +72,10 @@ pub enum TimePatternField {
 }
 
 pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
-    let mut tasks: Vec<Task> = Vec::with_capacity(file.tasks.len());
+    let mut tasks: Vec<TaskConfig> = Vec::with_capacity(file.tasks.len());
 
     for (i, config) in file.tasks.iter().enumerate() {
-        let task = Task::parse(config).context(format!(
+        let task = TaskConfig::parse(config).context(format!(
             "Malformed task '{}' at position {}",
             &config.name,
             i + 1
@@ -86,8 +89,8 @@ pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
     })
 }
 
-impl Task {
-    fn parse(config: &TaskConfig) -> Result<Self> {
+impl TaskConfig {
+    fn parse(config: &TaskDefinition) -> Result<Self> {
         if config.when.is_some() && config.every.is_some() {
             bail!(
                 "Task '{}' defines both 'when' and 'every'. Only one is allowed.",
@@ -115,6 +118,9 @@ impl Task {
             timezone,
             schedule,
             avoid_overlapping: config.avoid_overlapping,
+            runtime_dir: config.runtime_dir.clone(),
+            stdout: config.stdout.clone(),
+            stderr: config.stderr.clone(),
         })
     }
 }
