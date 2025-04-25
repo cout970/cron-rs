@@ -1,17 +1,19 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde_with::skip_serializing_none;
+use std::path::{Path, PathBuf};
 use std::collections::HashMap;
-
+use std::ops::Not;
 use super::logging::LoggingConfig;
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ConfigFile {
     pub tasks: Vec<TaskDefinition>,
     pub logging: Option<LoggingConfig>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TaskDefinition {
     pub name: String,
     pub cmd: String,
@@ -22,6 +24,7 @@ pub struct TaskDefinition {
     #[serde(default)]
     pub timezone: Option<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "skip_if_false")]
     pub avoid_overlapping: bool,
     #[serde(default)]
     pub run_as: Option<String>,
@@ -39,14 +42,14 @@ pub struct TaskDefinition {
     pub stderr: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum TimePatternConfig {
     Short(String),
     Long(ExplodedTimePatternConfig),
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExplodedTimePatternConfig {
     pub second: Option<ExplodedTimePatternFieldConfig>,
     pub minute: Option<ExplodedTimePatternFieldConfig>,
@@ -57,7 +60,7 @@ pub struct ExplodedTimePatternConfig {
     pub day_of_week: Option<ExplodedTimePatternFieldConfig>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum ExplodedTimePatternFieldConfig {
     Number(u32),
@@ -65,9 +68,13 @@ pub enum ExplodedTimePatternFieldConfig {
     List(Vec<String>),
 }
 
-pub fn read_config_file(path: &str) -> anyhow::Result<ConfigFile> {
+pub fn read_config_file<P: AsRef<Path>>(path: P) -> anyhow::Result<ConfigFile> {
     let content = std::fs::read_to_string(path).context("Failed to read config file")?;
     let config = serde_yml::from_str(&content).context("Failed to parse config file")?;
 
     Ok(config)
+}
+
+fn skip_if_false(arg: &bool) -> bool {
+    !*arg
 }
