@@ -1,0 +1,72 @@
+# Define where to store logs
+logging:
+  output: stdout # stdout, file or syslog
+  # file: /var/log/cron-rs.log # if output is file, the path to the file
+  level: info # debug, info, warning, error, critical
+
+tasks:
+  - name: Sample task
+
+    ## Command to run
+    cmd: echo 'hello world'
+
+    ## Define when to run the task
+    when:
+      # '*' means every value, '*' is the default value
+      # Single value like 'Mon', '0', '2025' match the current date exactly
+      # Range like 'Mon-Fri', '0-23', '2023-2025' match the current date in the range, including the start and end values
+      # List like '[Mon, Tue]', '[0, 1, 2]', '[2023, 2024]' match the current date in the list
+      # Ratios like '*/2', '*/5', '*/5+1' match the current date in the ratio, every 2 min, every 5 min, every 5 min starting from 1 (1, 6, 11, etc.)
+
+      # day_of_week: Mon, Tue, Wed, Thu, Fri, Sat, Sun
+      day_of_week: '*'
+      # year: 2023, 2024, 2025, ...
+      year: '*'
+      # month: 1, 2, ..., 12
+      month: '*'
+      # day: 1, 2, ..., 31
+      day: '*'
+      # hour: 0, 1, ..., 23
+      hour: '*'
+      # minute: 0, 1, ..., 59
+      minute: '*'
+      # second: 0, 1, ..., 59
+      second: '*'
+
+    ## Alternatively, you can use a single string to define the when condition
+    # when: '* *-*-* *:*:*' # 'day_of_week year-month-day hour:minute:second'
+
+    ## Instead of a time pattern, you can run the task every x seconds
+    ## This option is incompatible with the 'when' option, only one of them can be used
+    # every: 5 second
+    # every: 10 minute
+    # every: 1 hour
+    
+    ## Define the timezone to run the task, but default uses the system timezone
+    # timezone: 'Europe/Madrid'
+    
+    ## Avoid overlapping of tasks, if set to true, the task will not start if the previous instance is still running
+    # avoid_overlapping: true
+
+    ## Execute the command using a different user and group (only on unix-like systems)
+    # run_as: 'unprivileged:unprivileged' # user:group
+    
+    ## Set a max execution time for the task, the max granularity is 1 second, once the time is reached, a SIGTERM signal is sent to the process
+    # time_limit: 60 second
+    
+    ## Define the shell to use to run the command, by default is /bin/sh
+    # shell: /bin/bash
+    
+    ## Define the working directory to run the command
+    # working_directory: /
+    
+    ## Define the environment variables to set before running the task
+    # env:
+    #   VAR1: value1
+    #   VAR2: value2
+    
+    ## Pipe the command's stdout to a file, by default the output is stored in .tmp/{task_name}_stdout.log
+    # stdout: 'output.log'
+    
+    ## Pipe the command's stderr to a file, by default the output is stored in .tmp/{task_name}_stderr.log
+    # stderr: 'output.log'

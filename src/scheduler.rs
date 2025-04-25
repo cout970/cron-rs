@@ -1,19 +1,21 @@
-use std::fs::File;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
-use chrono::{DateTime, Datelike, Local, Timelike};
-use signal_hook::consts::SIGINT;
-use sysinfo::{Pid, System};
 use crate::config::{Schedule, TaskConfig, TimePatternField};
 use chrono::TimeZone;
+use chrono::{DateTime, Datelike, Local, Timelike};
 use chrono_tz::Tz;
-use std::path::PathBuf;
-use std::process::Child;
-use sysinfo::ProcessStatus;
 use log::{debug, error, info, warn};
+use signal_hook::consts::SIGINT;
+use std::collections::HashMap;
+use std::fs::File;
+use std::ops::{Add, Deref};
+use std::os::unix::prelude::CommandExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+use sysinfo::{Gid, Groups, ProcessStatus, User, Users};
+use sysinfo::{Pid, System};
 
 #[derive(Debug, Clone)]
 struct PendingTask {
@@ -28,12 +30,13 @@ struct ActiveTask {
     config: TaskConfig,
     pid: u32,
     start_time: Instant,
-    child: Child, 
+    child: Child,
+    time_limit: Option<u64>,
 }
 
 pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
     info!("Initializing scheduler with {} tasks", tasks.len());
-    
+
     // Detect CTRL+C to stop the infinite loop
     let term = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&term))?;
@@ -47,7 +50,10 @@ pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
             Schedule::Every { interval } => {
                 if *interval < min_interval {
                     min_interval = *interval;
-                    debug!("Updated min_interval to {:?} for task '{}'", interval, task.name);
+                    debug!(
+                        "Updated min_interval to {:?} for task '{}'",
+                        interval, task.name
+                    );
                 }
             }
             Schedule::When { time } => {
@@ -57,7 +63,10 @@ pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
                     }
                     _ => {
                         min_interval = Duration::from_secs(1);
-                        debug!("Task '{}' requires second-level precision, setting min_interval to 1s", task.name);
+                        debug!(
+                            "Task '{}' requires second-level precision, setting min_interval to 1s",
+                            task.name
+                        );
                     }
                 }
             }
@@ -66,21 +75,28 @@ pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
 
     info!("Minimum check interval set to {:?}", min_interval);
 
-    let mut pending_tasks = tasks.into_iter().map(|task| {
-        debug!("Initializing task '{}' with timezone {:?}", task.name, task.timezone);
-        PendingTask {
-            config: task,
-            last_execution: None,
-            last_pid: None,
-            retries: 0,
-        }
-    }).collect::<Vec<_>>();
+    let mut pending_tasks = tasks
+        .into_iter()
+        .map(|task| {
+            debug!(
+                "Initializing task '{}' with timezone {:?}",
+                task.name, task.timezone
+            );
+            PendingTask {
+                config: task,
+                last_execution: None,
+                last_pid: None,
+                retries: 0,
+            }
+        })
+        .collect::<Vec<_>>();
 
     let mut active_tasks = Vec::new();
 
     info!("Starting main scheduler loop");
     while !term.load(Ordering::Relaxed) {
         remove_inactive_tasks(&mut active_tasks);
+        check_time_limits(&mut active_tasks);
         run_pending_tasks(&mut pending_tasks, &mut active_tasks);
         thread::sleep(min_interval);
     }
@@ -90,16 +106,21 @@ pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
 
 fn remove_inactive_tasks(active_tasks: &mut Vec<ActiveTask>) {
     let mut dead_pids = Vec::new();
-    
+
     for task in &mut *active_tasks {
         match task.child.try_wait() {
             Ok(Some(status)) => {
-                info!("Task {} finished with status: {}, elapsed {} seconds", task.config.name, status, task.start_time.elapsed().as_secs());
+                info!(
+                    "Task {} finished with status: {}, elapsed {} seconds",
+                    task.config.name,
+                    status,
+                    task.start_time.elapsed().as_secs()
+                );
                 dead_pids.push(task.pid);
-            },
+            }
             Ok(None) => {
                 // Task is still running, do nothing
-            },
+            }
             Err(e) => {
                 error!("error attempting to wait: {}", e);
                 dead_pids.push(task.pid);
@@ -115,8 +136,14 @@ fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTas
     debug!("Checking {} tasks for execution", tasks.len());
 
     for task in tasks {
-        let date: DateTime<Tz> = task.config.timezone.from_utc_datetime(&chrono::Utc::now().naive_utc());
-        debug!("Current time in task '{}' timezone: {}", task.config.name, date);
+        let date: DateTime<Tz> = task
+            .config
+            .timezone
+            .from_utc_datetime(&chrono::Utc::now().naive_utc());
+        debug!(
+            "Current time in task '{}' timezone: {}",
+            task.config.name, date
+        );
 
         if !is_task_scheduled(task, now, date) {
             continue;
@@ -133,7 +160,10 @@ fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTas
             }
 
             // Check if task is in active_tasks
-            if active_tasks.iter().any(|active| active.config.name == task.config.name) {
+            if active_tasks
+                .iter()
+                .any(|active| active.config.name == task.config.name)
+            {
                 warn!("Task '{}' is already running. Skipping execution due to avoid_overlapping=true.", 
                     task.config.name);
                 continue;
@@ -145,49 +175,173 @@ fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTas
 }
 
 fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<ActiveTask>) {
-    let stdout_path = PathBuf::from(task.config.stdout.as_deref().unwrap_or(".tmp/stdout.log"));
-    let stderr_path = PathBuf::from(task.config.stderr.as_deref().unwrap_or(".tmp/stderr.log"));
+    let stdout_path = if let Some(path) = task.config.stdout.as_deref() {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(format!(
+            ".tmp/{}_stdout.log",
+            task_name_to_filename(&task.config.name)
+        ))
+    };
 
-    if let Some(path) =  stdout_path.parent() {
+    let stderr_path = if let Some(path) = task.config.stderr.as_deref() {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(format!(
+            ".tmp/{}_stderr.log",
+            task_name_to_filename(&task.config.name)
+        ))
+    };
+
+    if let Some(path) = stdout_path.parent() {
         if !path.exists() {
-            std::fs::create_dir_all(path).expect(format!("Failed to create stdout parent directory for task '{}'", task.config.name).as_str());
+            std::fs::create_dir_all(path).expect(
+                format!(
+                    "Failed to create stdout parent directory for task '{}'",
+                    task.config.name
+                )
+                .as_str(),
+            );
         }
     }
     if let Some(path) = stderr_path.parent() {
         if !path.exists() {
-            std::fs::create_dir_all(path).expect(format!("Failed to create stderr parent directory for task '{}'", task.config.name).as_str());
+            std::fs::create_dir_all(path).expect(
+                format!(
+                    "Failed to create stderr parent directory for task '{}'",
+                    task.config.name
+                )
+                .as_str(),
+            );
         }
     }
+
     let stdout = match File::create(&stdout_path) {
         Ok(file) => file,
         Err(e) => {
-            error!("Failed to create {} for task '{}': {}", stdout_path.to_string_lossy(), task.config.name, e);
+            error!(
+                "Failed to create {} for task '{}': {}",
+                stdout_path.to_string_lossy(),
+                task.config.name,
+                e
+            );
             return;
         }
     };
     let stderr = match File::create(&stderr_path) {
         Ok(file) => file,
         Err(e) => {
-            error!("Failed to create {} for task '{}': {}", stderr_path.to_string_lossy(), task.config.name, e);
+            error!(
+                "Failed to create {} for task '{}': {}",
+                stderr_path.to_string_lossy(),
+                task.config.name,
+                e
+            );
             return;
         }
     };
 
-    let mut cmd = Command::new("sh");
+    // Record debug information, to show in case of failure
+    let mut debug_info = String::new();
+
+    // Shell to run the command
+    let shell = task.config.shell.as_deref().unwrap_or_else(|| "/bin/sh");
+
+    debug_info.push_str(&format!("Cmd: {} -c '{}'\n", shell, task.config.cmd));
+    let mut cmd = Command::new(shell);
     cmd.arg("-c");
     cmd.arg(&task.config.cmd);
 
-    if let Some(dir) = &task.config.runtime_dir {
-        cmd.current_dir(dir);
-        debug!("Set runtime directory to '{}' for task '{}'", dir, task.config.name);
+    // Set environment variables if specified
+    if let Some(env) = &task.config.env {
+        for (key, value) in env {
+            debug_info.push_str(&format!("Env '{}' => '{}'\n", key, value));
+            cmd.env(key, value);
+        }
+        debug!(
+            "Set {} environment variables for task '{}'",
+            env.len(),
+            task.config.name
+        );
     }
 
+    // Set working directory if specified
+    if let Some(dir) = &task.config.working_directory {
+        debug_info.push_str(&format!("Working dir '{}'\n", dir));
+        cmd.current_dir(dir);
+        debug!(
+            "Set runtime directory to '{}' for task '{}'",
+            dir, task.config.name
+        );
+    }
+
+    // Set output redirection
+    debug_info.push_str(&format!("Stdio '{}'\n", stdout_path.to_string_lossy()));
+    debug_info.push_str(&format!("Stderr '{}'\n", stderr_path.to_string_lossy()));
     cmd.stdout(Stdio::from(stdout));
     cmd.stderr(Stdio::from(stderr));
 
+    // Run as another user if specified
+    if let Some(run_as) = &task.config.run_as {
+        // Only available on Unix-like systems
+        if cfg!(unix) {
+            let (user_str, group_str) = run_as.split_once(':').unwrap_or((run_as, run_as));
+
+            let users = Users::new_with_refreshed_list();
+            let uid = users
+                .list()
+                .iter()
+                .find(|u| u.name() == user_str || u.id().to_string() == user_str)
+                .map(|user| user.id());
+
+            let Some(uid) = uid else {
+                error!(
+                    "User '{}' not found for task '{}'",
+                    user_str, task.config.name
+                );
+                return;
+            };
+
+            let groups = Groups::new_with_refreshed_list();
+            let gid = groups
+                .list()
+                .iter()
+                .find(|g| g.name() == group_str || g.id().to_string() == group_str)
+                .map(|group| group.id());
+
+            let Some(gid) = gid else {
+                error!(
+                    "Group '{}' not found for task '{}'",
+                    user_str, task.config.name
+                );
+                return;
+            };
+            // uid and gid are opaque types, there is no operation to convert them to u32, but they deref() as u32, so add(0) works
+            debug_info.push_str(&format!("Uid {} '{}'\n", uid.add(0u32), user_str));
+            debug_info.push_str(&format!("Gid {} '{}'\n", gid.add(0u32), group_str));
+            unsafe {
+                cmd.uid(uid.add(0u32));
+                cmd.gid(gid.add(0u32));
+            }
+            debug!(
+                "Task '{}' will run as user '{}' and group '{}'",
+                task.config.name, user_str, group_str
+            );
+        } else {
+            warn!(
+                "Task '{}' cannot run as '{}', unsupported on this platform",
+                task.config.name, run_as
+            );
+        }
+    }
+
     match cmd.spawn() {
         Ok(child) => {
-            info!("Task '{}' started with PID: {}", task.config.name, child.id());
+            info!(
+                "Task '{}' started with PID: {}",
+                task.config.name,
+                child.id()
+            );
             task.last_execution = Some(now);
             task.last_pid = Some(child.id());
             active_tasks.push(ActiveTask {
@@ -195,10 +349,21 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
                 pid: child.id(),
                 start_time: now,
                 child,
+                time_limit: task.config.time_limit,
             });
         }
         Err(e) => {
-            error!("Task '{}' failed to start: {}", task.config.name, e);
+            if e.to_string().contains("Operation not permitted") && task.config.run_as.is_some() {
+                debug_info.push_str(&format!(
+                    "Note: The task was executed with run_as '{}', make sure the current user '{}' has permission to run as that user",
+                    task.config.run_as.as_deref().unwrap(),
+                    users::get_current_username().map(|s|s.to_string_lossy().to_string()).unwrap_or_else(|| "<unknown>".to_string())
+                ));
+            }
+            error!(
+                "Task '{}' failed to start: {}, Debug info:\n{}",
+                task.config.name, e, debug_info
+            );
         }
     }
 }
@@ -209,8 +374,10 @@ fn is_task_scheduled(task: &PendingTask, now: Instant, date: DateTime<Tz>) -> bo
             if let Some(last_execution) = task.last_execution {
                 let elapsed = now.duration_since(last_execution);
                 let should_run = elapsed >= *interval;
-                debug!("Task '{}' interval check: elapsed={:?}, interval={:?}, should_run={}", 
-                    task.config.name, elapsed, interval, should_run);
+                debug!(
+                    "Task '{}' interval check: elapsed={:?}, interval={:?}, should_run={}",
+                    task.config.name, elapsed, interval, should_run
+                );
                 should_run
             } else {
                 debug!("Task '{}' first execution", task.config.name);
@@ -226,18 +393,21 @@ fn is_task_scheduled(task: &PendingTask, now: Instant, date: DateTime<Tz>) -> bo
             let month = date.month();
             let year = date.year();
 
-            let matches = matches_time_pattern(&time.second, second) &&
-                matches_time_pattern(&time.minute, minute) &&
-                matches_time_pattern(&time.hour, hour) &&
-                matches_time_pattern(&time.day_of_week, day_of_week) &&
-                matches_time_pattern(&time.day, day) &&
-                matches_time_pattern(&time.month, month) &&
-                matches_time_pattern(&time.year, year as u32);
+            let matches = matches_time_pattern(&time.second, second)
+                && matches_time_pattern(&time.minute, minute)
+                && matches_time_pattern(&time.hour, hour)
+                && matches_time_pattern(&time.day_of_week, day_of_week)
+                && matches_time_pattern(&time.day, day)
+                && matches_time_pattern(&time.month, month)
+                && matches_time_pattern(&time.year, year as u32);
 
             if matches {
                 debug!("Task '{}' matches schedule at {}", task.config.name, date);
             } else {
-                debug!("Task '{}' does not match schedule at {}", task.config.name, date);
+                debug!(
+                    "Task '{}' does not match schedule at {}",
+                    task.config.name, date
+                );
             }
 
             matches
@@ -253,4 +423,34 @@ fn matches_time_pattern(pattern: &TimePatternField, value: u32) -> bool {
         TimePatternField::List(values) => values.contains(&value),
         TimePatternField::Ratio(divisor, offset) => value % divisor + *offset == 0,
     }
+}
+
+fn check_time_limits(active_tasks: &mut Vec<ActiveTask>) {
+    let now = Instant::now();
+    let mut to_remove = Vec::new();
+
+    for (i, task) in active_tasks.iter_mut().enumerate() {
+        if let Some(time_limit) = task.time_limit {
+            let elapsed = now.duration_since(task.start_time).as_secs();
+            if elapsed >= time_limit {
+                warn!(
+                    "Task '{}' (PID: {}) exceeded time limit of {} seconds",
+                    task.config.name, task.pid, time_limit
+                );
+
+                task.child.kill().expect("Failed to kill task");
+
+                to_remove.push(i);
+            }
+        }
+    }
+
+    // Remove terminated tasks in reverse order to maintain indices
+    for i in to_remove.into_iter().rev() {
+        active_tasks.remove(i);
+    }
+}
+
+fn task_name_to_filename(name: &str) -> String {
+    sanitise_file_name::sanitise(name)
 }

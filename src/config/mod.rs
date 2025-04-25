@@ -24,15 +24,21 @@ use self::timeunit::TimeUnit;
 use self::logging::LoggingConfig;
 
 use std::time::Duration;
+use std::collections::HashMap;
+use log::warn;
 
 #[derive(Debug, Clone)]
 pub struct TaskConfig {
     pub name: String,
     pub cmd: String,
-    pub timezone: Tz,
     pub schedule: Schedule,
+    pub timezone: Tz,
     pub avoid_overlapping: bool,
-    pub runtime_dir: Option<String>,
+    pub run_as: Option<String>,
+    pub time_limit: Option<u64>,
+    pub working_directory: Option<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub shell: Option<String>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
 }
@@ -45,7 +51,7 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub enum Schedule {
-    Every { interval: std::time::Duration },
+    Every { interval: Duration },
     When { time: TimePattern },
 }
 
@@ -101,7 +107,7 @@ impl TaskConfig {
         let schedule = if let Some(when) = &config.when {
             Schedule::parse_when(when)?
         } else if let Some(every) = &config.every {
-            Schedule::parse_every(every.clone())?
+            Schedule::parse_every(every.as_str())?
         } else {
             bail!("No schedule specified for task '{}'", config.name);
         };
@@ -112,13 +118,27 @@ impl TaskConfig {
             iana_time_zone::get_timezone().expect("Unable to get system timezone").parse()?
         };
 
+        let time_limit = if let Some(def) = &config.time_limit {
+            let duration = Schedule::parse_time_duration(def)?;
+            if duration.as_secs() < 1 {
+                warn!("Task '{}': cannot have a time limit of less than 1 second. Changed to 1 second", config.name);
+            }
+            Some(duration.as_secs().min(1))
+        } else {
+            None
+        };
+
         Ok(Self {
             name: config.name.clone(),
             cmd: config.cmd.clone(),
-            timezone,
             schedule,
+            timezone,
             avoid_overlapping: config.avoid_overlapping,
-            runtime_dir: config.runtime_dir.clone(),
+            run_as: config.run_as.clone(),
+            time_limit,
+            shell: config.shell.clone(),
+            working_directory: config.working_directory.clone(),
+            env: config.env.clone(),
             stdout: config.stdout.clone(),
             stderr: config.stderr.clone(),
         })
@@ -126,9 +146,7 @@ impl TaskConfig {
 }
 
 impl Schedule {
-    fn parse_every(config: String) -> Result<Self> {
-        let input = config.as_str();
-
+    fn parse_time_duration(input: &str) -> Result<Duration> {
         let amount_unit = separated_pair(number, space0, TimeUnit::parse);
         let line = delimited(space0, amount_unit, space0);
 
@@ -136,8 +154,12 @@ impl Schedule {
 
         let (amount, unit) = result.map_err(|e| anyhow!("Failed to parse: {}", e))?.1;
 
+        Ok(unit.to_duration(amount))
+    }
+    
+    fn parse_every(input: &str) -> Result<Self> {
         Ok(Self::Every {
-            interval: unit.to_duration(amount),
+            interval: Self::parse_time_duration(input)?,
         })
     }
 
