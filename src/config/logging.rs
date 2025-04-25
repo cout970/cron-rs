@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Ord, PartialOrd, Eq, PartialEq)]
 pub enum LogOutput {
     #[serde(rename = "stdout")]
     #[default]

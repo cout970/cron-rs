@@ -6,6 +6,8 @@ pub mod timeunit;
 pub mod validation;
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::TimeZone;
+use chrono_tz::{Tz, UTC};
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{digit1, multispace0, space0};
@@ -14,18 +16,16 @@ use nom::error::ParseError;
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, preceded, separated_pair, tuple};
 use nom::{AsChar, IResult, InputTakeAtPosition, Parser};
-use chrono::{TimeZone};
-use chrono_tz::{Tz, UTC};
 
 use self::dayofweek::DayOfWeek;
-use self::file::{ConfigFile, ExplodedTimePatternConfig, TaskDefinition, TimePatternConfig};
 use self::file::ExplodedTimePatternFieldConfig;
-use self::timeunit::TimeUnit;
+use self::file::{ConfigFile, ExplodedTimePatternConfig, TaskDefinition, TimePatternConfig};
 use self::logging::LoggingConfig;
+use self::timeunit::TimeUnit;
 
-use std::time::Duration;
-use std::collections::HashMap;
 use log::warn;
+use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct TaskConfig {
@@ -89,7 +89,7 @@ pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
         tasks.push(task);
     }
 
-    Ok(Config { 
+    Ok(Config {
         tasks,
         logging: file.logging.clone().unwrap_or_default(),
     })
@@ -115,7 +115,9 @@ impl TaskConfig {
         let timezone: Tz = if let Some(timezone_name) = &config.timezone {
             timezone_name.parse()?
         } else {
-            iana_time_zone::get_timezone().expect("Unable to get system timezone").parse()?
+            iana_time_zone::get_timezone()
+                .expect("Unable to get system timezone")
+                .parse()?
         };
 
         let time_limit = if let Some(def) = &config.time_limit {
@@ -156,7 +158,7 @@ impl Schedule {
 
         Ok(unit.to_duration(amount))
     }
-    
+
     fn parse_every(input: &str) -> Result<Self> {
         Ok(Self::Every {
             interval: Self::parse_time_duration(input)?,
@@ -240,7 +242,7 @@ fn number(input: &str) -> IResult<&str, u32> {
 }
 
 fn number_or_daw(i: &str) -> IResult<&str, u32> {
-    alt((ws(map(DayOfWeek::parse, DayOfWeek::to_u32)), ws(number)))(i)
+    alt((number, map(DayOfWeek::parse, DayOfWeek::to_u32)))(i)
 }
 
 fn time_atom<'a>(allow_dow: bool) -> impl FnMut(&'a str) -> IResult<&'a str, u32> {

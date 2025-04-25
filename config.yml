@@ -18,7 +18,7 @@ tasks:
 
   - name: Task2
     cmd: echo 'hello'
-    when: '[Mon,Tue] *-*/2-01..04 12:00:00'
+    when: '[Mon,Tue] *-*/2-01 12:00:00'
 
   - name: Task3
     cmd: echo 'hello'

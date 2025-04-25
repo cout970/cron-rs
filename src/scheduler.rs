@@ -285,43 +285,20 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
     if let Some(run_as) = &task.config.run_as {
         // Only available on Unix-like systems
         if cfg!(unix) {
-            let (user_str, group_str) = run_as.split_once(':').unwrap_or((run_as, run_as));
-
-            let users = Users::new_with_refreshed_list();
-            let uid = users
-                .list()
-                .iter()
-                .find(|u| u.name() == user_str || u.id().to_string() == user_str)
-                .map(|user| user.id());
-
-            let Some(uid) = uid else {
-                error!(
-                    "User '{}' not found for task '{}'",
-                    user_str, task.config.name
-                );
-                return;
+            let (uid, user_str, gid, group_str) = match get_uid_and_gid(run_as) {
+                Ok((uid, user_str, gid, group_str)) => (uid, user_str, gid, group_str),
+                Err(e) => {
+                    error!("Failed to get uid and gid for task '{}': {}", task.config.name, e);
+                    return;
+                }
             };
 
-            let groups = Groups::new_with_refreshed_list();
-            let gid = groups
-                .list()
-                .iter()
-                .find(|g| g.name() == group_str || g.id().to_string() == group_str)
-                .map(|group| group.id());
-
-            let Some(gid) = gid else {
-                error!(
-                    "Group '{}' not found for task '{}'",
-                    user_str, task.config.name
-                );
-                return;
-            };
             // uid and gid are opaque types, there is no operation to convert them to u32, but they deref() as u32, so add(0) works
-            debug_info.push_str(&format!("Uid {} '{}'\n", uid.add(0u32), user_str));
-            debug_info.push_str(&format!("Gid {} '{}'\n", gid.add(0u32), group_str));
+            debug_info.push_str(&format!("Uid {} '{}'\n", uid, user_str));
+            debug_info.push_str(&format!("Gid {} '{}'\n", gid, group_str));
             unsafe {
-                cmd.uid(uid.add(0u32));
-                cmd.gid(gid.add(0u32));
+                cmd.uid(uid);
+                cmd.gid(gid);
             }
             debug!(
                 "Task '{}' will run as user '{}' and group '{}'",
@@ -366,6 +343,34 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
             );
         }
     }
+}
+
+fn get_uid_and_gid(run_as: &str) -> anyhow::Result<(u32, String, u32, String)> {
+    let (user_str, group_str) = run_as.split_once(':').unwrap_or((run_as, run_as));
+    let users = Users::new_with_refreshed_list();
+    
+    let uid = users
+        .list()
+        .iter()
+        .find(|u| u.name() == user_str || u.id().to_string() == user_str)
+        .map(|user| user.id());
+
+    let Some(uid) = uid else {
+        return Err(anyhow::anyhow!("User '{}' not found", user_str));
+    };
+
+    let groups = Groups::new_with_refreshed_list();
+    let gid = groups
+        .list()
+        .iter()
+        .find(|g| g.name() == group_str || g.id().to_string() == group_str)
+        .map(|group| group.id());
+
+    let Some(gid) = gid else {
+        return Err(anyhow::anyhow!("Group '{}' not found", group_str));
+    };
+    
+    Ok((uid.add(0u32), user_str.to_string(), gid.add(0u32), group_str.to_string()))
 }
 
 fn is_task_scheduled(task: &PendingTask, now: Instant, date: DateTime<Tz>) -> bool {
