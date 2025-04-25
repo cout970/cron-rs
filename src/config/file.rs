@@ -4,12 +4,14 @@ use serde_with::skip_serializing_none;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::ops::Not;
+use crate::alerts::AlertConfig;
 use super::logging::LoggingConfig;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ConfigFile {
     pub tasks: Vec<TaskDefinition>,
     pub logging: Option<LoggingConfig>,
+    pub alerts: Option<AlertConfig>,
 }
 
 #[skip_serializing_none]
