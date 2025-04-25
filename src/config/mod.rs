@@ -1,5 +1,6 @@
 pub mod dayofweek;
 pub mod file;
+pub mod logging;
 pub mod shorthand;
 pub mod timeunit;
 pub mod validation;
@@ -20,12 +21,14 @@ use self::dayofweek::DayOfWeek;
 use self::file::ExplodedTimePatternFieldConfig;
 use self::file::{ConfigFile, ExplodedTimePatternConfig, TaskConfig, TimePatternConfig};
 use self::timeunit::TimeUnit;
+use self::logging::LoggingConfig;
 
 use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Config {
     pub tasks: Vec<Task>,
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug)]
@@ -64,7 +67,7 @@ pub enum TimePatternField {
     Ratio(u32, u32), // */5+2
 }
 
-pub fn parse_config_file(file: ConfigFile) -> Result<Config> {
+pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
     let mut tasks: Vec<Task> = Vec::with_capacity(file.tasks.len());
 
     for (i, config) in file.tasks.iter().enumerate() {
@@ -76,7 +79,10 @@ pub fn parse_config_file(file: ConfigFile) -> Result<Config> {
         tasks.push(task);
     }
 
-    Ok(Config { tasks })
+    Ok(Config { 
+        tasks,
+        logging: file.logging.clone().unwrap_or_default(),
+    })
 }
 
 impl Task {

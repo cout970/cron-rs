@@ -1,9 +1,11 @@
 #![allow(unused)]
 
 mod config;
+mod logging;
 mod scheduler;
 
 use clap::Parser;
+use log::{debug, error, info, warn};
 
 use config::file::read_config_file;
 use config::validation::{validate_config, ValidationResult};
@@ -28,34 +30,40 @@ fn main() -> anyhow::Result<()> {
 
     let config_file = read_config_file(&args.config)?;
 
-    //  Validate config file
+    // Parse config into tasks to run
+    let config = parse_config_file(&config_file)?;
+
+    // Setup logging
+    logging::setup_logging(&config.logging)?;
+
+    info!("Starting cron-rs with config file: {}", args.config);
+
+    // Validate config file
     if args.validate {
         let info = validate_config(&config_file);
 
         for msg in &info {
             match msg {
                 ValidationResult::Error(m) => {
-                    println!("[Error] {}", m);
+                    error!("{}", m);
                 }
                 ValidationResult::Warning(m) => {
-                    println!("[Warning] {}", m);
+                    warn!("{}", m);
                 }
             }
         }
 
         if info.is_empty() {
-            println!("Config file is OK");
+            info!("Config file is valid");
         }
     }
 
-    // Parse config into tasks to run
-    let config = parse_config_file(config_file)?;
-    // dbg!(&config);
+    debug!("Parsed config: {:?}", config);
 
-    println!("Starting event loop");
+    info!("Starting event loop");
     start_scheduler(config.tasks)?;
 
-    println!("Exiting");
+    info!("Exiting");
     Ok(())
 }
 

@@ -8,6 +8,8 @@ use chrono::{DateTime, Datelike, Local, Timelike};
 use signal_hook::consts::SIGTERM;
 use sysinfo::{Pid, System};
 use crate::config::{Schedule, Task, TimePatternField};
+use chrono::TimeZone;
+use chrono_tz::Tz;
 
 struct PendingTask {
     config: Task,
@@ -17,6 +19,7 @@ struct PendingTask {
 }
 
 pub fn start_scheduler(tasks: Vec<Task>) -> anyhow::Result<()> {
+    // Detect CTRL+C to stop the infinite loop
     let term = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGTERM, Arc::clone(&term))?;
 
@@ -49,8 +52,6 @@ pub fn start_scheduler(tasks: Vec<Task>) -> anyhow::Result<()> {
         retries: 0,
     }).collect::<Vec<_>>();
 
-
-
     while !term.load(Ordering::Relaxed) {
         run_pending_tasks(&mut pending_tasks);
         thread::sleep(min_interval);
@@ -60,9 +61,10 @@ pub fn start_scheduler(tasks: Vec<Task>) -> anyhow::Result<()> {
 
 fn run_pending_tasks(tasks: &mut [PendingTask]) {
     let now = Instant::now();
-    let date = Local::now();
 
     for task in tasks {
+        let date: DateTime<Tz> = task.config.timezone.from_utc_datetime(&chrono::Utc::now().naive_utc());
+
         if !is_task_scheduled(task, now, date) {
             continue;
         }
@@ -102,7 +104,7 @@ fn run_pending_tasks(tasks: &mut [PendingTask]) {
     }
 }
 
-fn is_task_scheduled(task: &PendingTask, now: Instant, date: DateTime<Local>) -> bool {
+fn is_task_scheduled(task: &PendingTask, now: Instant, date: DateTime<Tz>) -> bool {
     match &task.config.schedule {
         Schedule::Every { interval } => {
             if let Some(last_execution) = task.last_execution {

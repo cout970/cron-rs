@@ -9,6 +9,7 @@ A Rust-based task scheduler that allows you to run commands at specified times u
 - Timezone support
 - Command execution
 - Config validation
+- Configurable logging (stdout, file, or syslog)
 
 ## Installation
 
@@ -21,6 +22,11 @@ cargo install --path .
 1. Create a configuration file (e.g., `config.yml`) with your tasks:
 
 ```yaml
+logging:
+  output: file  # Options: stdout, file, syslog
+  level: info   # Options: error, warn, info, debug, trace
+  path: /var/log/cron-rs.log  # Required if output is 'file'
+
 tasks:
   - name: MyTask
     cmd: echo 'hello'
@@ -47,6 +53,34 @@ cron-rs --config config.yml
 
 ```bash
 cron-rs --config config.yml --validate
+```
+
+## Logging Configuration
+
+The logging configuration supports three output types:
+
+1. `stdout` (default): Logs are written to standard output
+2. `file`: Logs are written to a specified file
+3. `syslog`: Logs are written to the system syslog
+
+Example configurations:
+
+```yaml
+# Log to stdout (default)
+logging:
+  output: stdout
+  level: info
+
+# Log to file
+logging:
+  output: file
+  level: debug
+  path: /var/log/cron-rs.log
+
+# Log to syslog
+logging:
+  output: syslog
+  level: warn
 ```
 
 ## Configuration Format
