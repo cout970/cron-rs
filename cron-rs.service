@@ -1,0 +1,19 @@
+# Example systemd service config to run the cron automatically
+# Copy to /etc/systemd/system/cron-rs.service
+# Make sure to create the config file at /etc/cron-rs.yml and set the permissions to 0600 and owned by root
+# Run `sudo systemctl daemon-reload`, `sudo systemctl enable cron-rs.service` and `sudo systemctl start cron-rs.service`
+
+[Unit]
+Description=Cron-rs Task Scheduler
+After=network.target
+
+[Service]
+ExecStart=/bin/cron-rs run
+Restart=on-failure
+RestartSec=5s
+WorkingDirectory=/tmp
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,7 @@
 # cron-rs
 
-A Rust-based task scheduler that allows you to run commands at specified times using a flexible configuration format.
+A Rust-based task scheduler to run commands at specified intervals, providing a modern alternative to traditional cron jobs. 
+It supports YAML-based configuration, flexible scheduling syntax, and various output options.
 
 ## Features
 
@@ -22,6 +23,8 @@ A Rust-based task scheduler that allows you to run commands at specified times u
 - Task execution time measurement
 - Shell customization
 - Parallel task execution
+
+See the [default config](./src/config/default_config.yml) for the list of available options.
 
 ## Installation
 
