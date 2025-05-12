@@ -6,6 +6,7 @@ logging:
 
 # Define alerts to send when tasks fail
 alerts:
+  # Notify when a task fails
   on_failure:
     # Send an email when a task fails
     - type: email
@@ -28,6 +29,9 @@ alerts:
       body: '{"task_name": "{{ task_name }}", "exit_code": "{{ exit_code }}"}'
       headers:
         - 'Content-Type: application/json'
+
+  # Notify when a task succeeds, will be called for any task that has a successful run
+  on_success: []
 
 tasks:
   - name: Sample task
