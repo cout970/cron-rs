@@ -11,7 +11,7 @@ pub fn setup_logging(config: &LoggingConfig) -> Result<()> {
         LogOutput::Stdout => {
             env_logger::Builder::new()
                 .filter_level(level)
-                .format_timestamp_secs()
+                .format_timestamp_millis()
                 .init();
         }
         LogOutput::File => {
@@ -22,7 +22,7 @@ pub fn setup_logging(config: &LoggingConfig) -> Result<()> {
 
             env_logger::Builder::new()
                 .filter_level(level)
-                .format_timestamp_secs()
+                .format_timestamp_millis()
                 .target(env_logger::Target::Pipe(Box::new(file)))
                 .init();
         }
