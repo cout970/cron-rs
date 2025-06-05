@@ -1,9 +1,13 @@
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use super::logging::LoggingConfig;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct ConfigFile {
     pub tasks: Vec<TaskConfig>,
+    pub logging: Option<LoggingConfig>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
