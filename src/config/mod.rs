@@ -128,7 +128,7 @@ impl TaskConfig {
             if duration.as_secs() < 1 {
                 warn!("Task '{}': cannot have a time limit of less than 1 second. Changed to 1 second", config.name);
             }
-            Some(duration.as_secs().min(1))
+            Some(duration.as_secs().max(1))
         } else {
             None
         };
@@ -193,6 +193,16 @@ impl TimePattern {
                 Ok(TimePatternField::Any)
             }
         }
+        fn field_second(
+            opt: &Option<ExplodedTimePatternFieldConfig>,
+            allow_dow: bool,
+        ) -> Result<TimePatternField> {
+            if let Some(field) = opt {
+                TimePatternField::parse_exploded_field(field, allow_dow)
+            } else {
+                Ok(TimePatternField::Value(0))
+            }
+        }
 
         Ok(TimePattern {
             year: field(&config.year, false).context("Malformed field: year")?,
@@ -200,7 +210,7 @@ impl TimePattern {
             day: field(&config.day, false).context("Malformed field: day")?,
             hour: field(&config.hour, false).context("Malformed field: hour")?,
             minute: field(&config.minute, false).context("Malformed field: minute")?,
-            second: field(&config.second, false).context("Malformed field: second")?,
+            second: field_second(&config.second, false).context("Malformed field: second")?,
             day_of_week: field(&config.day_of_week, true)
                 .context("Malformed field: day_of_week")?,
         })
