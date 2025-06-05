@@ -312,7 +312,8 @@ fn validate_output_path(path: &str) -> Option<String> {
             .unwrap_or(false)
         {
             return Some(format!(
-                "Parent directory '{}' is not writable",
+                "Cannot create file '{}', parent directory '{}' is not writable",
+                path.display(),
                 parent.display()
             ));
         }
