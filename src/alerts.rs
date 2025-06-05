@@ -1,9 +1,14 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{Message, SmtpTransport, Transport};
 use log::{error, info};
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
-use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AlertConfig {
@@ -16,8 +21,12 @@ pub enum Alert {
     #[serde(rename = "email")]
     Email {
         to: String,
-        subject: String,
-        body: String,
+        #[serde(default)]
+        subject: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        from: Option<String>,
         #[serde(default)]
         smtp_server: Option<String>,
         #[serde(default)]
@@ -28,22 +37,17 @@ pub enum Alert {
         smtp_password: Option<String>,
     },
     #[serde(rename = "cmd")]
-    Cmd {
-        cmd: String,
-    },
+    Cmd { cmd: String },
     #[serde(rename = "webhook")]
     Webhook {
         url: String,
-        #[serde(default = "default_webhook_method")]
-        method: String,
-        body: String,
         #[serde(default)]
-        headers: Vec<String>,
+        method: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        headers: HashMap<String, String>,
     },
-}
-
-fn default_webhook_method() -> String {
-    "POST".to_string()
 }
 
 pub struct TaskExecutionDetails {
@@ -60,6 +64,7 @@ pub struct TaskExecutionDetails {
 pub fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
     match alert {
         Alert::Email {
+            from,
             to,
             subject,
             body,
@@ -68,32 +73,45 @@ pub fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
             smtp_username,
             smtp_password,
         } => {
-            let body = template_replace(body, details);
-            let subject = template_replace(subject, details);
+            let from = from
+                .clone()
+                .unwrap_or_else(|| "cron-rs@localhost".to_string());
+            let body = body.clone().unwrap_or_else(|| {
+                "Task {{ task_name }} failed with exit code {{ exit_code }}".to_string()
+            });
+            let subject = subject
+                .clone()
+                .unwrap_or_else(|| "Task Failure Alert".to_string());
 
-            // TODO use SMTP client library instead of shell command
-            let mut cmd = Command::new("mail");
-            cmd.arg("-s").arg(&subject);
+            let body = template_replace(&body, details);
+            let subject = template_replace(&subject, details);
 
-            // TODO: for each values that is None, use the default value, e.g. smtp_port = 25
-            if let (Some(server), Some(port), Some(username), Some(password)) = 
-                (smtp_server, smtp_port, smtp_username, smtp_password) {
-                cmd.arg("-S")
-                    .arg(format!("smtp={}:{}", server, port))
-                    .arg("-S")
-                    .arg(format!("smtp-auth-user={}", username))
-                    .arg("-S")
-                    .arg(format!("smtp-auth-password={}", password));
+            let email = Message::builder()
+                .from(from.parse()?)
+                .to(to.parse()?)
+                .subject(subject)
+                .body(body)?;
+
+            let server = smtp_server
+                .clone()
+                .unwrap_or_else(|| "localhost".to_string());
+            let port = smtp_port.unwrap_or(25);
+            let username = smtp_username.clone().unwrap_or_default();
+            let password = smtp_password.clone().unwrap_or_default();
+
+            let mut mailer = if server == "localhost" || port == 25 {
+                SmtpTransport::builder_dangerous(server).port(port)
+            } else {
+                SmtpTransport::relay(&server)?.port(port)
+            };
+
+            if let (Some(username), Some(password)) = (smtp_username, smtp_password) {
+                mailer = mailer.credentials(Credentials::new(username.clone(), password.clone()));
             }
 
-            cmd.arg(&to);
-
-            let output = cmd.output()?;
-            if !output.status.success() {
-                error!(
-                    "Failed to send email alert: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+            match mailer.build().send(&email) {
+                Ok(_) => info!("Email sent successfully"),
+                Err(e) => error!("Failed to send email: {}", e),
             }
         }
         Alert::Cmd { cmd } => {
@@ -112,34 +130,44 @@ pub fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
             body,
             headers,
         } => {
-            let body = template_replace(body, details);
+            let body = body.clone().unwrap_or_else(|| {
+                "Task {{ task_name }} failed with exit code {{ exit_code }}".to_string()
+            });
+            let body = template_replace(&body, details);
 
-            // TODO use a request library instead of shell command
-            let mut cmd = Command::new("curl");
-            cmd.arg("-X").arg(method).arg(url);
+            let client = Client::new();
+            let mut request = match method.as_deref() {
+                Some("GET") => client.get(url),
+                Some("POST") => client.post(url),
+                Some("PUT") => client.put(url),
+                Some("PATCH") => client.patch(url),
+                Some("DELETE") => client.delete(url),
+                _ => client.post(url),
+            };
 
-            for header in headers {
-                cmd.arg("-H").arg(header);
-            }
-
-            cmd.arg("-d").arg(&body);
-
-            let output = cmd.output()?;
-            if !output.status.success() {
-                error!(
-                    "Failed to send webhook alert: {}",
-                    String::from_utf8_lossy(&output.stderr)
+            let mut header_map = HeaderMap::new();
+            for (key, value) in headers {
+                header_map.insert(
+                    HeaderName::from_bytes(key.trim().as_bytes())?,
+                    HeaderValue::from_str(value.trim())?,
                 );
+            }
+            request = request.headers(header_map).body(body);
+
+            match request.send() {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        error!("Webhook request failed with status: {}", response.status());
+                    }
+                }
+                Err(e) => error!("Failed to send webhook: {}", e),
             }
         }
     }
     Ok(())
 }
 
-fn template_replace(
-    template: &str,
-    details: &TaskExecutionDetails,
-) -> String {
+fn template_replace(template: &str, details: &TaskExecutionDetails) -> String {
     let mut result = template.to_string();
     result = result.replace("{{ task_name }}", &details.task_name);
     result = result.replace("{{ exit_code }}", &details.exit_code.to_string());

@@ -1,5 +1,6 @@
-use crate::config::{Schedule, TaskConfig, TimePatternField};
-use chrono::TimeZone;
+use crate::alerts::{send_alert, AlertConfig, TaskExecutionDetails};
+use crate::config::{Config, Schedule, TaskConfig, TimePatternField};
+use chrono::{TimeZone, Utc};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use chrono_tz::Tz;
 use log::{debug, error, info, warn};
@@ -9,11 +10,11 @@ use std::fs::File;
 use std::ops::{Add, Deref};
 use std::os::unix::prelude::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{Gid, Groups, ProcessStatus, User, Users};
 use sysinfo::{Pid, System};
 
@@ -29,13 +30,17 @@ struct PendingTask {
 struct ActiveTask {
     config: TaskConfig,
     pid: u32,
-    start_time: Instant,
+    start_instant: Instant,
+    start_time: DateTime<Utc>,
     child: Child,
+    debug_info: String,
     time_limit: Option<u64>,
+    stdout: PathBuf,
+    stderr: PathBuf,
 }
 
-pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
-    info!("Initializing scheduler with {} tasks", tasks.len());
+pub fn start_scheduler(config: &Config) -> anyhow::Result<()> {
+    info!("Initializing scheduler with {} tasks", config.tasks.len());
 
     // Detect CTRL+C to stop the infinite loop
     let term = Arc::new(AtomicBool::new(false));
@@ -45,7 +50,7 @@ pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
     let mut min_interval = Duration::from_secs(60);
     debug!("Calculating minimum interval for task checks");
 
-    for task in &tasks {
+    for task in &config.tasks {
         match &task.schedule {
             Schedule::Every { interval } => {
                 if *interval < min_interval {
@@ -75,7 +80,9 @@ pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
 
     info!("Minimum check interval set to {:?}", min_interval);
 
-    let mut pending_tasks = tasks
+    let mut pending_tasks = config
+        .tasks
+        .clone()
         .into_iter()
         .map(|task| {
             debug!(
@@ -95,27 +102,53 @@ pub fn start_scheduler(tasks: Vec<TaskConfig>) -> anyhow::Result<()> {
 
     info!("Starting main scheduler loop");
     while !term.load(Ordering::Relaxed) {
-        remove_inactive_tasks(&mut active_tasks);
+        remove_inactive_tasks(&mut active_tasks, &config.alerts);
         check_time_limits(&mut active_tasks);
-        run_pending_tasks(&mut pending_tasks, &mut active_tasks);
+        run_pending_tasks(&mut pending_tasks, &mut active_tasks, &config.alerts);
         thread::sleep(min_interval);
     }
     info!("Scheduler shutdown initiated");
     Ok(())
 }
 
-fn remove_inactive_tasks(active_tasks: &mut Vec<ActiveTask>) {
+fn remove_inactive_tasks(active_tasks: &mut Vec<ActiveTask>, alerts: &AlertConfig) {
     let mut dead_pids = Vec::new();
 
     for task in &mut *active_tasks {
         match task.child.try_wait() {
             Ok(Some(status)) => {
+                let exit_code = status.code().unwrap_or(-1);
+                let execution_time = task.start_instant.elapsed();
                 info!(
                     "Task {} finished with status: {}, elapsed {} seconds",
                     task.config.name,
                     status,
-                    task.start_time.elapsed().as_secs()
+                    execution_time.as_secs()
                 );
+
+                if !status.success() {
+                    error!(
+                        "Task '{}' failed with exit code {}",
+                        task.config.name, exit_code
+                    );
+
+                    let details = TaskExecutionDetails {
+                        task_name: task.config.name.to_string(),
+                        exit_code,
+                        start_time: task.start_time,
+                        duration: execution_time,
+                        error_message: format!(
+                            "Task '{}' failed with exit code {}",
+                            task.config.name, exit_code
+                        ),
+                        debug_info: task.debug_info.clone(),
+                        stdout: std::fs::read_to_string(&task.stdout).unwrap_or_default(),
+                        stderr: std::fs::read_to_string(&task.stderr).unwrap_or_default(),
+                    };
+
+                    on_failure(&details, alerts);
+                }
+
                 dead_pids.push(task.pid);
             }
             Ok(None) => {
@@ -131,7 +164,7 @@ fn remove_inactive_tasks(active_tasks: &mut Vec<ActiveTask>) {
     active_tasks.retain(|task| !dead_pids.contains(&task.pid));
 }
 
-fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTask>) {
+fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTask>, alerts: &AlertConfig) {
     let now = Instant::now();
     debug!("Checking {} tasks for execution", tasks.len());
 
@@ -170,11 +203,11 @@ fn run_pending_tasks(tasks: &mut [PendingTask], active_tasks: &mut Vec<ActiveTas
             }
         }
 
-        execute_task(task, now, active_tasks);
+        execute_task(task, now, active_tasks, alerts);
     }
 }
 
-fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<ActiveTask>) {
+fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<ActiveTask>, alerts: &AlertConfig) {
     let stdout_path = if let Some(path) = task.config.stdout.as_deref() {
         PathBuf::from(path)
     } else {
@@ -288,7 +321,10 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
             let (uid, user_str, gid, group_str) = match get_uid_and_gid(run_as) {
                 Ok((uid, user_str, gid, group_str)) => (uid, user_str, gid, group_str),
                 Err(e) => {
-                    error!("Failed to get uid and gid for task '{}': {}", task.config.name, e);
+                    error!(
+                        "Failed to get uid and gid for task '{}': {}",
+                        task.config.name, e
+                    );
                     return;
                 }
             };
@@ -312,6 +348,8 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
         }
     }
 
+    let clock_time: DateTime<Utc> = Utc::now();
+    
     match cmd.spawn() {
         Ok(child) => {
             info!(
@@ -324,9 +362,13 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
             active_tasks.push(ActiveTask {
                 config: task.config.clone(),
                 pid: child.id(),
-                start_time: now,
+                start_instant: now,
+                start_time: clock_time,
                 child,
+                debug_info: debug_info.clone(),
                 time_limit: task.config.time_limit,
+                stdout: stdout_path.clone(),
+                stderr: stderr_path.clone(),
             });
         }
         Err(e) => {
@@ -341,6 +383,19 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
                 "Task '{}' failed to start: {}, Debug info:\n{}",
                 task.config.name, e, debug_info
             );
+
+            let details = TaskExecutionDetails {
+                task_name: task.config.name.to_string(),
+                exit_code: -1,
+                start_time: clock_time,
+                duration: Duration::default(),
+                error_message: format!("Task '{}' failed to start", task.config.name),
+                debug_info,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            };
+
+            on_failure(&details, alerts);
         }
     }
 }
@@ -348,7 +403,7 @@ fn execute_task(task: &mut PendingTask, now: Instant, active_tasks: &mut Vec<Act
 fn get_uid_and_gid(run_as: &str) -> anyhow::Result<(u32, String, u32, String)> {
     let (user_str, group_str) = run_as.split_once(':').unwrap_or((run_as, run_as));
     let users = Users::new_with_refreshed_list();
-    
+
     let uid = users
         .list()
         .iter()
@@ -369,8 +424,13 @@ fn get_uid_and_gid(run_as: &str) -> anyhow::Result<(u32, String, u32, String)> {
     let Some(gid) = gid else {
         return Err(anyhow::anyhow!("Group '{}' not found", group_str));
     };
-    
-    Ok((uid.add(0u32), user_str.to_string(), gid.add(0u32), group_str.to_string()))
+
+    Ok((
+        uid.add(0u32),
+        user_str.to_string(),
+        gid.add(0u32),
+        group_str.to_string(),
+    ))
 }
 
 fn is_task_scheduled(task: &PendingTask, now: Instant, date: DateTime<Tz>) -> bool {
@@ -436,7 +496,7 @@ fn check_time_limits(active_tasks: &mut Vec<ActiveTask>) {
 
     for (i, task) in active_tasks.iter_mut().enumerate() {
         if let Some(time_limit) = task.time_limit {
-            let elapsed = now.duration_since(task.start_time).as_secs();
+            let elapsed = now.duration_since(task.start_instant).as_secs();
             if elapsed >= time_limit {
                 warn!(
                     "Task '{}' (PID: {}) exceeded time limit of {} seconds",
@@ -458,4 +518,15 @@ fn check_time_limits(active_tasks: &mut Vec<ActiveTask>) {
 
 fn task_name_to_filename(name: &str) -> String {
     sanitise_file_name::sanitise(name)
+}
+
+fn on_failure(details: &TaskExecutionDetails, alerts: &AlertConfig) {
+    for alert in &alerts.on_failure {
+        if let Err(e) = send_alert(alert, details) {
+            error!(
+                "Failed to send alert for task '{}': {}",
+                details.task_name, e
+            );
+        }
+    }
 }

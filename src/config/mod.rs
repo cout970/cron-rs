@@ -26,6 +26,7 @@ use self::timeunit::TimeUnit;
 use log::warn;
 use std::collections::HashMap;
 use std::time::Duration;
+use crate::alerts::AlertConfig;
 
 #[derive(Debug, Clone)]
 pub struct TaskConfig {
@@ -47,6 +48,7 @@ pub struct TaskConfig {
 pub struct Config {
     pub tasks: Vec<TaskConfig>,
     pub logging: LoggingConfig,
+    pub alerts: AlertConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,7 @@ pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
     Ok(Config {
         tasks,
         logging: file.logging.clone().unwrap_or_default(),
+        alerts: file.alerts.clone().unwrap_or_default(),
     })
 }
 

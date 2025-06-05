@@ -4,6 +4,31 @@ logging:
   # file: /var/log/cron-rs.log # if output is file, the path to the file
   level: info # debug, info, warning, error, critical
 
+# Define alerts to send when tasks fail
+alerts:
+  on_failure:
+    # Send an email when a task fails
+    - type: email
+      to: 'admin@example.com'
+      subject: 'Task failed'
+      body: 'The task {{ task_name }} failed with exit code {{ exit_code }}'
+      smtp_server: 'smtp.example.com'
+      smtp_port: 587
+      smtp_username: 'user@example.com'
+      smtp_password: 'password'
+
+    # Execute a command when a task fails
+    - type: cmd
+      cmd: 'mail -s "Task failed" admin@example.com'
+
+    # Send a webhook when a task fails
+    - type: webhook
+      url: 'https://example.com/webhook'
+      method: POST
+      body: '{"task_name": "{{ task_name }}", "exit_code": "{{ exit_code }}"}'
+      headers:
+        - 'Content-Type: application/json'
+
 tasks:
   - name: Sample task
 

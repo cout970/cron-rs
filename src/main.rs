@@ -4,6 +4,8 @@ mod config;
 mod logging;
 mod scheduler;
 
+mod alerts;
+
 use clap::{Parser, Subcommand};
 use log::{debug, error, info, warn, LevelFilter};
 use std::path::PathBuf;
@@ -59,7 +61,7 @@ fn main() -> anyhow::Result<()> {
 
             info!("Starting cron-rs with config file: {}", args.config);
             info!("Starting event loop");
-            start_scheduler(config.tasks)?;
+            start_scheduler(&config)?;
 
             info!("Exiting");
             Ok(())
