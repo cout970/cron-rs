@@ -21,14 +21,15 @@ use config::validation::{validate_config, ValidationResult};
 use log::{debug, error, info, warn, LevelFilter};
 use std::io::{stdout, Write};
 use std::path::PathBuf;
-
+use crate::alerts::AlertConfig;
+use crate::config::logging::LoggingConfig;
 use crate::scheduler::Scheduler;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Path to the config file
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -47,14 +48,18 @@ enum ArgCmd {
     /// Write the default config file in ./default_config.yml
     GenerateConfig {
         /// Path to the file to write
-        path: Option<PathBuf>,
+        #[arg(long, short)]
+        output: Option<PathBuf>,
     },
     /// Look up the current user's crontab file and genera an equivalent config file
     GenerateFromCrontab {
-        /// Path to the file to write
-        path: Option<PathBuf>,
         /// Path to the crontab file to read
+        #[arg(long, short = 'f')]
         crontab_file: Option<PathBuf>,
+
+        /// Path to the file to write
+        #[arg(long, short)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -75,12 +80,12 @@ fn main() -> anyhow::Result<()> {
             cmd_validate_config_file(path)?;
             Ok(())
         }
-        ArgCmd::GenerateConfig { path } => {
-            cmd_generate_default_config(path)?;
+        ArgCmd::GenerateConfig { output } => {
+            cmd_generate_default_config(output)?;
             Ok(())
         }
-        ArgCmd::GenerateFromCrontab { path, crontab_file } => {
-            cmd_generate_config_from_crontab(path, crontab_file)?;
+        ArgCmd::GenerateFromCrontab { output, crontab_file } => {
+            cmd_generate_config_from_crontab(output, crontab_file)?;
             Ok(())
         }
     }
@@ -162,6 +167,8 @@ fn cmd_generate_config_from_crontab(
     let tasks = parse_crontab_file(&crontab)?;
     let config = ConfigFile {
         tasks,
+        logging: Some(LoggingConfig { ..Default::default() }),
+        alerts: Some(AlertConfig { ..Default::default() }),
         ..Default::default()
     };
 
@@ -186,7 +193,7 @@ fn print_config_file(contents: &[u8], path: &Option<PathBuf>) -> anyhow::Result<
                         path.to_string_lossy()
                     ));
                 }
-                if !path.metadata()?.permissions().readonly() {
+                if path.metadata()?.permissions().readonly() {
                     return Err(anyhow::anyhow!(
                         "File {} is not writable",
                         path.to_string_lossy()
@@ -194,10 +201,10 @@ fn print_config_file(contents: &[u8], path: &Option<PathBuf>) -> anyhow::Result<
                 }
             } else {
                 if let Some(parent) = path.parent() {
-                    if !parent.is_dir() || !parent.metadata()?.permissions().readonly() {
+                    if !parent.is_dir() || parent.metadata()?.permissions().readonly() {
                         return Err(anyhow::anyhow!(
                             "Directory {} is not writable",
-                            parent.to_string_lossy()
+                            parent.to_string_lossy(),
                         ));
                     }
                 }
@@ -229,6 +236,7 @@ fn parse_crontab_file(crontab: &str) -> anyhow::Result<Vec<TaskDefinition>> {
         }
 
         if line.starts_with('#') {
+            last_comment.push_str(" ");
             last_comment.push_str(line[1..].trim());
             continue;
         }
@@ -249,19 +257,67 @@ fn parse_crontab_file(crontab: &str) -> anyhow::Result<Vec<TaskDefinition>> {
             last_comment.trim().to_string()
         };
 
+        let map = |s: &str| {
+            let mut text = s.replace("-", "..");
+            if text.contains(',') {
+                let options: Vec<String> = text.split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+
+                let mut result = vec![];
+
+                for opt in options {
+                    if opt.contains("..") {
+                        let range_parts: Vec<&str> = opt.split("..").collect();
+                        if range_parts.len() != 2 {
+                            warn!("Found invalid range format in crontab, ignoring: {}", opt);
+                            continue;
+                        }
+
+                        let (start, end) = match (range_parts[0].parse::<u32>(), range_parts[1].parse::<u32>()) {
+                            (Ok(start), Ok(end)) => (start, end),
+                            _ => {
+                                warn!("Found non-numeric range in crontab, ignoring: {}", opt);
+                                continue;
+                            }
+                        };
+
+                        if start > end {
+                            warn!("Found invalid range in crontab, ignoring: {}", opt);
+                            continue;
+                        }
+
+                        for i in start..=end {
+                            result.push(i.to_string());
+                        }
+                    } else {
+                        result.push(opt);
+                    }
+                }
+
+                if result.len() == 1 {
+                    let first = result.into_iter().next().unwrap();
+                    ExplodedTimePatternFieldConfig::Text(first)
+                } else {
+                    let list = format!("[{}]", result.join(", "));
+                    ExplodedTimePatternFieldConfig::Text(list)
+                }
+            } else {
+                ExplodedTimePatternFieldConfig::Text(text)
+            }
+        };
+
         let task = TaskDefinition {
             name,
             cmd,
             when: Some(TimePatternConfig::Long(ExplodedTimePatternConfig {
-                second: Some(ExplodedTimePatternFieldConfig::Number(0)),
-                minute: Some(ExplodedTimePatternFieldConfig::Text(minute.to_string())),
-                hour: Some(ExplodedTimePatternFieldConfig::Text(hour.to_string())),
-                day: Some(ExplodedTimePatternFieldConfig::Text(day.to_string())),
-                month: Some(ExplodedTimePatternFieldConfig::Text(month.to_string())),
-                year: Some(ExplodedTimePatternFieldConfig::Text("*".to_string())),
-                day_of_week: Some(ExplodedTimePatternFieldConfig::Text(
-                    day_of_week.replace("-", "..").to_string(),
-                )),
+                second: None,
+                minute: Some(map(minute)),
+                hour: Some(map(hour)),
+                day: Some(map(day)),
+                month: Some(map(month)),
+                year: None,
+                day_of_week: Some(map(day_of_week)),
             })),
             ..Default::default()
         };

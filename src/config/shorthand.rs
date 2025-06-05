@@ -121,7 +121,7 @@ pub fn range<'a>(allow_dow: bool) -> impl FnMut(&'a str) -> IResult<&'a str, Tim
     map(
         separated_pair(
             time_atom(allow_dow),
-            ws(tag("..")),
+            ws(alt((tag(".."), tag("..=")))),
             cut(time_atom(allow_dow)),
         ),
         |(a, b)| TimePatternField::Range(a, b),

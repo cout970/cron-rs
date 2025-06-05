@@ -15,6 +15,7 @@ pub enum LogOutput {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoggingConfig {
     pub output: LogOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<PathBuf>,
     pub level: String,
 }

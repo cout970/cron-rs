@@ -53,12 +53,19 @@ pub enum TimePatternConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExplodedTimePatternConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub second: Option<ExplodedTimePatternFieldConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub minute: Option<ExplodedTimePatternFieldConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hour: Option<ExplodedTimePatternFieldConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub day: Option<ExplodedTimePatternFieldConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub month: Option<ExplodedTimePatternFieldConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub year: Option<ExplodedTimePatternFieldConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub day_of_week: Option<ExplodedTimePatternFieldConfig>,
 }
 
