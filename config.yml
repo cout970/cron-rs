@@ -1,0 +1,26 @@
+tasks:
+  - name: Task1
+    cmd: echo 'hello'
+    when:
+      day_of_week:
+        - Mon
+        - tHu
+      year: '*'
+      month: '*'
+      day: '*/2'
+      hour: 12
+      minute: 0
+      second: 0
+
+  - name: Task2
+    cmd: echo 'hello'
+    when: '[Mon,Tue] *-*/2-01..04 12:00:00'
+
+  - name: Task3
+    cmd: echo 'hello'
+    when: '[Mon,Thu] 14..18-*/5+2-[2, 15, 24] 12:00:00'
+
+  - name: Task5
+    cmd: echo 'hello'
+    when: '[Mon,Thu] 14..18-*/5+2-00 12:00:*'
+    timezone: 'Europe/Madrid'
