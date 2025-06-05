@@ -8,11 +8,14 @@ mod alerts;
 
 mod utils;
 
+use crate::alerts::AlertConfig;
 use crate::config::file::ConfigFile;
 use crate::config::file::ExplodedTimePatternConfig;
 use crate::config::file::ExplodedTimePatternFieldConfig;
 use crate::config::file::TaskDefinition;
 use crate::config::file::TimePatternConfig;
+use crate::config::logging::LoggingConfig;
+use crate::scheduler::Scheduler;
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use config::file::read_config_file;
@@ -21,9 +24,6 @@ use config::validation::{validate_config, ValidationResult};
 use log::{debug, error, info, warn, LevelFilter};
 use std::io::{stdout, Write};
 use std::path::PathBuf;
-use crate::alerts::AlertConfig;
-use crate::config::logging::LoggingConfig;
-use crate::scheduler::Scheduler;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -92,14 +92,45 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_run(config_path: PathBuf) -> anyhow::Result<()> {
+    match std::fs::metadata(&config_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(anyhow!("Config path {} is not a file", config_path.to_string_lossy()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                if metadata.mode() & 0o002 != 0 {
+                    let error = anyhow!(concat!(
+                        "Config file {} is globally writable by any user.\n",
+                        "###\n",
+                        "THIS IS MAYOR SECURITY RISK\n",
+                        "###\n",
+                        "Any user can alter the config file and add tasks that will be run with the current user's permissions.\n",
+                        "Refusing to run with insecure file permissions (mod {:o})"
+                    ),
+                        config_path.to_string_lossy(),
+                        (metadata.mode() & 0o777)
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to read config file {}: {}",
+                config_path.to_string_lossy(),
+                e
+            ));
+        }
+    }
+
     let config_file = read_config_file(&config_path)?;
     let config = parse_config_file(&config_file)?;
     logging::setup_logging(&config.logging)?;
 
-    info!(
-        "Starting cron-rs with config file: {}",
-        config_path.to_string_lossy()
-    );
+    info!("Starting cron-rs with config file: {}", config_path.to_string_lossy());
 
     Scheduler::new(config).run();
 
@@ -139,15 +170,11 @@ fn cmd_validate_config_file(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_generate_config_from_crontab(
-    path: Option<PathBuf>,
-    crontab_file: Option<PathBuf>,
-) -> anyhow::Result<()> {
+fn cmd_generate_config_from_crontab(path: Option<PathBuf>, crontab_file: Option<PathBuf>) -> anyhow::Result<()> {
     // Crontab file contents
     let crontab = if let Some(crontab_file) = crontab_file {
         // If a file path is provided, read the crontab from that file
-        std::fs::read_to_string(crontab_file)
-            .map_err(|e| anyhow::anyhow!("Failed to read crontab: {}", e))?
+        std::fs::read_to_string(crontab_file).map_err(|e| anyhow::anyhow!("Failed to read crontab: {}", e))?
     } else {
         // If no path is provided, use the crontab command to get the current user's crontab
         let output = std::process::Command::new("crontab")
@@ -166,9 +193,9 @@ fn cmd_generate_config_from_crontab(
 
     let tasks = parse_crontab_file(&crontab)?;
     let config = ConfigFile {
-        tasks,
         logging: Some(LoggingConfig { ..Default::default() }),
         alerts: Some(AlertConfig { ..Default::default() }),
+        tasks,
         ..Default::default()
     };
 
@@ -188,16 +215,10 @@ fn print_config_file(contents: &[u8], path: &Option<PathBuf>) -> anyhow::Result<
             // Validate the file is writable or does not exist and the directory is writable
             if path.exists() {
                 if !path.is_file() {
-                    return Err(anyhow::anyhow!(
-                        "Path {} is not a file",
-                        path.to_string_lossy()
-                    ));
+                    return Err(anyhow::anyhow!("Path {} is not a file", path.to_string_lossy()));
                 }
                 if path.metadata()?.permissions().readonly() {
-                    return Err(anyhow::anyhow!(
-                        "File {} is not writable",
-                        path.to_string_lossy()
-                    ));
+                    return Err(anyhow::anyhow!("File {} is not writable", path.to_string_lossy()));
                 }
             } else {
                 if let Some(parent) = path.parent() {
@@ -215,10 +236,7 @@ fn print_config_file(contents: &[u8], path: &Option<PathBuf>) -> anyhow::Result<
             println!("Generated config file at {}", path.to_string_lossy());
         }
         None => {
-            stdout()
-                .lock()
-                .write_all(contents)
-                .expect("Unable to write file");
+            stdout().lock().write_all(contents).expect("Unable to write file");
         }
     }
     Ok(())
@@ -247,8 +265,7 @@ fn parse_crontab_file(crontab: &str) -> anyhow::Result<Vec<TaskDefinition>> {
             continue;
         }
 
-        let (minute, hour, day, month, day_of_week) =
-            (parts[0], parts[1], parts[2], parts[3], parts[4]);
+        let (minute, hour, day, month, day_of_week) = (parts[0], parts[1], parts[2], parts[3], parts[4]);
         let cmd = parts[5..].join(" ");
 
         let name = if last_comment.trim().is_empty() {
@@ -260,9 +277,7 @@ fn parse_crontab_file(crontab: &str) -> anyhow::Result<Vec<TaskDefinition>> {
         let map = |s: &str| {
             let mut text = s.replace("-", "..");
             if text.contains(',') {
-                let options: Vec<String> = text.split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect();
+                let options: Vec<String> = text.split(',').map(|s| s.trim().to_string()).collect();
 
                 let mut result = vec![];
 
