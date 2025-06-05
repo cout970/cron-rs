@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use log::{error, info};
@@ -7,12 +7,17 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::Add;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
+use crate::utils::format_duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AlertConfig {
+    #[serde(default)]
     pub on_failure: Vec<Alert>,
+    #[serde(default)]
+    pub on_success: Vec<Alert>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,10 +177,11 @@ fn template_replace(template: &str, details: &TaskExecutionDetails) -> String {
     result = result.replace("{{ task_name }}", &details.task_name);
     result = result.replace("{{ exit_code }}", &details.exit_code.to_string());
     result = result.replace("{{ start_time }}", &details.start_time.to_rfc3339());
-    result = result.replace("{{ duration }}", &details.duration.as_secs().to_string());
+    result = result.replace("{{ duration }}", &format_duration(details.duration));
+    result = result.replace("{{ end_time }}", &details.start_time.add(TimeDelta::from_std(details.duration).unwrap()).to_rfc3339());
     result = result.replace("{{ error_message }}", &details.error_message);
     result = result.replace("{{ debug_info }}", &details.debug_info);
-    result = result.replace("{{ stdout }}", &details.stdout);
-    result = result.replace("{{ stderr }}", &details.stderr);
+    result = result.replace("{{ stdout }}", details.stdout.trim());
+    result = result.replace("{{ stderr }}", details.stderr.trim());
     result
 }
