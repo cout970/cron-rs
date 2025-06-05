@@ -6,6 +6,8 @@ mod scheduler;
 
 mod alerts;
 
+mod utils;
+
 use crate::config::file::ConfigFile;
 use crate::config::file::ExplodedTimePatternConfig;
 use crate::config::file::ExplodedTimePatternFieldConfig;
@@ -20,7 +22,7 @@ use log::{debug, error, info, warn, LevelFilter};
 use std::io::{stdout, Write};
 use std::path::PathBuf;
 
-use scheduler::start_scheduler;
+use crate::scheduler::Scheduler;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -65,7 +67,11 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         ArgCmd::Validate { path } => {
-            let path = if let Some(path) = path { path } else { get_config_path(args.config)? };
+            let path = if let Some(path) = path {
+                path
+            } else {
+                get_config_path(args.config)?
+            };
             cmd_validate_config_file(path)?;
             Ok(())
         }
@@ -90,7 +96,7 @@ fn cmd_run(config_path: PathBuf) -> anyhow::Result<()> {
         config_path.to_string_lossy()
     );
 
-    start_scheduler(&config)?;
+    Scheduler::new(config).run();
 
     info!("Exiting");
     Ok(())

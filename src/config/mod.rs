@@ -218,6 +218,71 @@ impl TimePattern {
 }
 
 impl TimePatternField {
+    /// Checks if the field matches a given value
+    pub fn matches_value(&self, value: u32) -> bool {
+        match self {
+            TimePatternField::Any => true,
+            TimePatternField::Value(v) => value == *v,
+            TimePatternField::Range(start, end) => value >= *start && value <= *end,
+            TimePatternField::List(values) => values.contains(&value),
+            TimePatternField::Ratio(divisor, offset) => value % divisor + *offset == 0,
+        }
+    }
+    
+    /// Returns a tuple with the next valid value and 1 if the value requires wrapping, 0 if it doesn't
+    pub fn get_next_valid_value(&self, the_value: u32, limit: u32) -> (u32, u32) {
+        let value = (the_value + limit) % limit;
+        match self {
+            TimePatternField::Any => (value, 0),
+            TimePatternField::Value(v) => {
+                if value <= *v {
+                    (*v, 0)
+                } else {
+                    (*v, 1)
+                }
+            }
+            TimePatternField::Range(start, end) => {
+                if value < *start {
+                    (*start, 0)
+                } else if value > *end {
+                    (*start, 1)
+                } else {
+                    (value, 0)
+                }
+            }
+            TimePatternField::List(values) => {
+                if let Some(next_value) = values.iter().find(|&&v| v >= value) {
+                    if value <= *next_value {
+                        (*next_value, 0)
+                    } else {
+                        (*next_value, 1)
+                    }
+                } else {
+                    // If no value is found, return the first value in the list
+                    (*values.first().unwrap_or(&value), 1)
+                }
+            }
+            TimePatternField::Ratio(divisor, offset) => {
+                let mut curr = value;
+                let mut rest = 0u32;
+
+                // Do a full cycle to find the next valid value
+                for i in 0..limit {
+                    if curr % divisor + *offset == 0 {
+                        return (curr, rest);
+                    }
+                    if curr + 1 >= limit {
+                        rest = 1;
+                    }
+                    curr = (curr + 1) % limit;
+                }
+
+                // No value matches the pattern, return the current value
+                (value, rest)
+            }
+        }
+    }
+    
     pub fn parse_exploded_field(
         config: &ExplodedTimePatternFieldConfig,
         allow_dow: bool,
