@@ -6,7 +6,7 @@ use chrono::TimeZone;
 use chrono_tz::Tz;
 use lettre::message::Mailbox;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -225,6 +225,8 @@ fn validate_user_group(user_group: &str) -> Option<String> {
     let user_exists = if let Ok(uid) = user.parse::<u32>() {
         Command::new("id")
             .arg("-u")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
             .arg(uid.to_string())
             .status()
             .map(|s| s.success())
@@ -232,6 +234,8 @@ fn validate_user_group(user_group: &str) -> Option<String> {
     } else {
         Command::new("id")
             .arg(user)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -242,19 +246,13 @@ fn validate_user_group(user_group: &str) -> Option<String> {
     }
 
     // Check if group exists (try both as name and gid)
-    let group_exists = if let Ok(gid) = group.parse::<u32>() {
-        Command::new("getent")
-            .args(["group", &gid.to_string()])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    } else {
-        Command::new("getent")
-            .args(["group", group])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
+    let group_exists = Command::new("getent")
+        .args(["group", group])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
 
     if !group_exists {
         return Some(format!("Group '{}' does not exist", group));
@@ -272,6 +270,8 @@ fn validate_shell(shell: &str) -> Option<String> {
     if !Command::new(shell)
         .arg("-c")
         .arg("exit 0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -305,6 +305,8 @@ fn validate_output_path(path: &str) -> Option<String> {
         // Try to check if directory is writable
         if !Command::new("test")
             .args(["-w", &parent.to_string_lossy()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
