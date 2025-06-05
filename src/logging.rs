@@ -14,11 +14,11 @@ pub fn setup_logging(config: &LoggingConfig) -> Result<()> {
                 .format_timestamp_secs()
                 .init();
         }
-        LogOutput::File(path) => {
+        LogOutput::File => {
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)?;
+                .open(config.file.clone().unwrap_or_else(|| PathBuf::from("/var/log/cron-rs.log")))?;
 
             env_logger::Builder::new()
                 .filter_level(level)

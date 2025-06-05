@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 use super::logging::LoggingConfig;
 
@@ -14,13 +15,24 @@ pub struct ConfigFile {
 pub struct TaskDefinition {
     pub name: String,
     pub cmd: String,
-    pub every: Option<String>,
+    #[serde(default)]
     pub when: Option<TimePatternConfig>,
+    #[serde(default)]
+    pub every: Option<String>,
+    #[serde(default)]
     pub timezone: Option<String>,
     #[serde(default)]
     pub avoid_overlapping: bool,
     #[serde(default)]
-    pub runtime_dir: Option<String>,
+    pub run_as: Option<String>,
+    #[serde(default)]
+    pub time_limit: Option<String>,
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
     #[serde(default)]
     pub stdout: Option<String>,
     #[serde(default)]

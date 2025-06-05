@@ -1,3 +1,7 @@
+logging:
+  output: stdout
+  level: info
+  
 tasks:
   - name: Task1
     cmd: echo 'hello'
@@ -24,6 +28,7 @@ tasks:
     cmd: date
     when: '* *-*-* *:*:*/5'
     avoid_overlapping: true
+    run_as: 1000:1000
 
   - name: Task5
     cmd: echo 'hello'

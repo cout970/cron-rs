@@ -11,7 +11,11 @@ A Rust-based task scheduler that allows you to run commands at specified times u
 - Config validation
 - Configurable logging (stdout, file, or syslog)
 - Concurrent execution prevention
-- Configurable output redirection and working directory
+- Custom working directory
+- Configurable output redirection
+- Time limits for tasks
+- Environment variable support
+- Run as different user
 
 ## Installation
 
@@ -44,9 +48,14 @@ tasks:
       second: 0
     timezone: 'Europe/Madrid'  # Optional
     avoid_overlapping: true    # Optional, prevents concurrent execution
-    runtime_dir: /path/to/work # Optional, working directory for the task
-    stdout: /path/to/stdout.log # Optional, defaults to .tmp/stdout.log
-    stderr: /path/to/stderr.log # Optional, defaults to .tmp/stderr.log
+    working_directory: /path/to/work # Optional, working directory for the task
+    stdout: /path/to/stdout.log # Optional
+    stderr: /path/to/stderr.log # Optional
+    time_limit: 300           # Optional, time limit in seconds
+    env:                      # Optional, environment variables
+      PATH: /usr/local/bin:/usr/bin:/bin
+      HOME: /home/user
+    run_as: www-data         # Optional, run as different user
 ```
 
 2. Run the scheduler:
@@ -68,9 +77,12 @@ cron-rs --config config.yml --validate
 - `cmd`: Command to execute
 - `timezone`: Timezone for the task (optional, defaults to system timezone)
 - `avoid_overlapping`: Boolean flag to prevent concurrent execution (optional, defaults to false)
-- `runtime_dir`: Working directory for the task (optional, defaults to current directory)
-- `stdout`: Path for stdout redirection (optional, defaults to .tmp/stdout.log)
-- `stderr`: Path for stderr redirection (optional, defaults to .tmp/stderr.log)
+- `working_directory`: Working directory for the task (optional, defaults to current directory)
+- `stdout`: Path for stdout redirection (optional)
+- `stderr`: Path for stderr redirection (optional)
+- `time_limit`: Maximum execution time in seconds (optional)
+- `env`: Environment variables for the task (optional)
+- `run_as`: User to run the task as (optional)
 
 ### Scheduling Options
 You can use either `when` or `every` to specify when a task should run:
@@ -91,6 +103,46 @@ when:
 ```yaml
 every: "5 minutes"  # or "1 hour", "2 days", etc.
 ```
+
+### Time Limits
+
+You can set a maximum execution time for tasks. If a task exceeds its time limit, it will be terminated:
+
+```yaml
+tasks:
+  - name: TimeLimitedTask
+    cmd: sleep 600
+    every: "1 minute"
+    time_limit: 300  # Task will be terminated after 5 minutes
+```
+
+### Environment Variables
+
+You can specify environment variables for each task:
+
+```yaml
+tasks:
+  - name: EnvTask
+    cmd: echo $MY_VAR
+    every: "5 minutes"
+    env:
+      MY_VAR: "Hello, World!"
+      PATH: /custom/path:/usr/bin:/bin
+```
+
+### Running as Different User
+
+You can run tasks as a different user:
+
+```yaml
+tasks:
+  - name: WebTask
+    cmd: touch /var/www/html/test.txt
+    every: "1 hour"
+    run_as: www-data
+```
+
+Note: The scheduler must have sufficient permissions to run commands as the specified user.
 
 ## Output Redirection
 
@@ -118,7 +170,7 @@ tasks:
   - name: WorkInDirectory
     cmd: ls -la
     every: "5 minutes"
-    runtime_dir: /path/to/directory
+    working_directory: /path/to/directory
 ```
 
 ## Concurrent Execution Prevention
