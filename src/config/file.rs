@@ -6,12 +6,12 @@ use super::logging::LoggingConfig;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct ConfigFile {
-    pub tasks: Vec<TaskConfig>,
+    pub tasks: Vec<TaskDefinition>,
     pub logging: Option<LoggingConfig>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
-pub struct TaskConfig {
+pub struct TaskDefinition {
     pub name: String,
     pub cmd: String,
     pub every: Option<String>,
@@ -19,6 +19,12 @@ pub struct TaskConfig {
     pub timezone: Option<String>,
     #[serde(default)]
     pub avoid_overlapping: bool,
+    #[serde(default)]
+    pub runtime_dir: Option<String>,
+    #[serde(default)]
+    pub stdout: Option<String>,
+    #[serde(default)]
+    pub stderr: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

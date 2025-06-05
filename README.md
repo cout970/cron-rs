@@ -11,6 +11,7 @@ A Rust-based task scheduler that allows you to run commands at specified times u
 - Config validation
 - Configurable logging (stdout, file, or syslog)
 - Concurrent execution prevention
+- Configurable output redirection and working directory
 
 ## Installation
 
@@ -43,6 +44,9 @@ tasks:
       second: 0
     timezone: 'Europe/Madrid'  # Optional
     avoid_overlapping: true    # Optional, prevents concurrent execution
+    runtime_dir: /path/to/work # Optional, working directory for the task
+    stdout: /path/to/stdout.log # Optional, defaults to .tmp/stdout.log
+    stderr: /path/to/stderr.log # Optional, defaults to .tmp/stderr.log
 ```
 
 2. Run the scheduler:
@@ -64,6 +68,9 @@ cron-rs --config config.yml --validate
 - `cmd`: Command to execute
 - `timezone`: Timezone for the task (optional, defaults to system timezone)
 - `avoid_overlapping`: Boolean flag to prevent concurrent execution (optional, defaults to false)
+- `runtime_dir`: Working directory for the task (optional, defaults to current directory)
+- `stdout`: Path for stdout redirection (optional, defaults to .tmp/stdout.log)
+- `stderr`: Path for stderr redirection (optional, defaults to .tmp/stderr.log)
 
 ### Scheduling Options
 You can use either `when` or `every` to specify when a task should run:
@@ -83,6 +90,35 @@ when:
 #### Using `every`:
 ```yaml
 every: "5 minutes"  # or "1 hour", "2 days", etc.
+```
+
+## Output Redirection
+
+By default, task output is redirected to files in a `.tmp` directory:
+- Standard output goes to `.tmp/stdout.log`
+- Standard error goes to `.tmp/stderr.log`
+
+You can customize these paths using the `stdout` and `stderr` options:
+
+```yaml
+tasks:
+  - name: CustomOutputTask
+    cmd: echo "Hello, World!"
+    every: "1 minute"
+    stdout: /var/log/myapp/stdout.log
+    stderr: /var/log/myapp/stderr.log
+```
+
+## Working Directory
+
+Tasks run in the current directory by default. You can specify a different working directory using the `runtime_dir` option:
+
+```yaml
+tasks:
+  - name: WorkInDirectory
+    cmd: ls -la
+    every: "5 minutes"
+    runtime_dir: /path/to/directory
 ```
 
 ## Concurrent Execution Prevention
@@ -185,16 +221,3 @@ timezone: 'Europe/Madrid'
 ```
 
 If not defined, it will use the system's default
-
-## Dependencies
-
-- anyhow
-- chrono
-- chrono-tz
-- clap
-- nom
-- serde
-- serde_yml
-- signal-hook
-- sysinfo
-- iana-time-zone
