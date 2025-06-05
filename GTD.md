@@ -1,39 +1,41 @@
 # Features
 
-- [x] Read yaml config file
-- [x] Avoid simultaneous execution
-- [x] In case of error, send a notification
-- [x] Enable/Disable field
-- [x] Allow to run more often than once per minute
-- [ ] Allow to wait a random amount of time before running a command to avoid conflicts, ex. 
-- [ ] Allow to run multiple commands and wait for one to finish before running the next one
-- [x] Allow to run commands in parallel
+- [x] Allow to choose the environment variables
 - [x] Allow to choose the user to run the command
 - [x] Allow to choose the working directory
-- [x] Allow to choose the environment variables
-- [x] Simpler syntax for scheduling, ej. every 2 hours, at 12:00, only on monday, etc.
-- [ ] Global configuration file, with option override single config options in a different file
+- [x] Allow to run commands in parallel
+- [x] Allow to run more often than once per minute
+- [x] Avoid simultaneous execution
+- [x] Enable/Disable field
+- [x] Global configuration file, with option override single config options in a different file
+- [x] In case of error, send a notification
 - [x] Limit execution time of task
-- [ ] Show schedule of tasks
+- [x] Measure execution time of tasks
+- [x] Read yaml config file
+- [x] Replace min interval for event loop with setInterval for each individual task
+- [x] Support cron syntax (GenerateFromCrontab create config file from crontab)
+- [x] Systemd service file template
+- [x] Warning if config file is writable by other users
+- [ ] Add support for more time expressions, like systemd https://silentlad.com/systemd-timers-oncalendar-(cron)-format-explained
+- [ ] Add support for multiple config files, one per user, with implicit "run_as", like crontab files
+- [ ] Alerts on failure/success (per task)
 - [ ] Allow to run a task manually
 - [ ] Allow to run a task only once, execute today at 8:30
-- [ ] Execute or not based on condition, ej. only if a file exists
-- [ ] Debug print tasks to run in time interval, without executing them
-- [ ] Allow to schedule a task to the end of every month, even if the month have 31 days
+- [ ] Allow to run multiple commands and wait for one to finish before running the next one
 - [ ] Allow to schedule a task to a unix timestamp
-- [x] Measure execution time of tasks
-- [x] Support cron syntax (GenerateFromCrontab create config file from crontab)
+- [ ] Allow to schedule a task to the end of every month, even if the month have 31/30/29/28 days
+- [ ] Allow to wait a random amount of time before running a command to avoid conflicts
+- [ ] Conditional exec if file exists
+- [ ] Custom validation for task success state
+- [ ] Debug print tasks to run in time interval, without executing them
+- [ ] Detect clock changes and warn user
+- [ ] Execution delay when the parallel execution is not allowed and an execution is already running
+- [ ] Hot reload config file changes without restarting the service
+- [ ] Import from systemd timers
+- [ ] Load secrets from file
 - [ ] Log format: sqlite table (not only logs, but tracking execution time, errors and other metadata so it can be queried)
-- [ ] Run inside docker container or run as a service
-- [x] replace min interval for event loop with setInterval for each individual task
-- [ ] retries on error
-- [ ] subtasks
-- [x] on_complete notification
-- [x] alerts
-- [ ] hot reload config
-- [ ] conditional exec if file exists
-- [ ] execution delay when the parallel execution is not allowed and an execution is already running
-- [ ] use env vars from .env file in config
-- [ ] load secrets from file
-- [ ] warning if config file is readable/writable by other users
-- [ ] custom validation for task success state
+- [ ] Retries on error
+- [ ] Run inside docker container
+- [ ] Show schedule of tasks, next exec, last exec, remaining time, etc.
+- [ ] Subtasks
+- [ ] Use env vars from .env file in config
