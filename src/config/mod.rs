@@ -25,13 +25,13 @@ use self::logging::LoggingConfig;
 
 use std::time::Duration;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub tasks: Vec<Task>,
     pub logging: LoggingConfig,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Task {
     pub name: String,
     pub cmd: String,
@@ -39,13 +39,13 @@ pub struct Task {
     pub schedule: Schedule,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Schedule {
     Every { interval: std::time::Duration },
     When { time: TimePattern },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TimePattern {
     pub second: TimePatternField,
     pub minute: TimePatternField,

@@ -20,6 +20,11 @@ tasks:
     cmd: echo 'hello'
     when: '[Mon,Thu] 14..18-*/5+2-[2, 15, 24] 12:00:00'
 
+  - name: Task4
+    cmd: date
+    when: '* *-*-* *:*:*/5'
+
+
   - name: Task5
     cmd: echo 'hello'
     when: '[Mon,Thu] 14..18-*/5+2-00 12:00:*'
