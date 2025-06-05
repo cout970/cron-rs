@@ -37,6 +37,7 @@ pub struct Task {
     pub cmd: String,
     pub timezone: Tz,
     pub schedule: Schedule,
+    pub avoid_overlapping: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +114,7 @@ impl Task {
             cmd: config.cmd.clone(),
             timezone,
             schedule,
+            avoid_overlapping: config.avoid_overlapping,
         })
     }
 }
