@@ -10,11 +10,11 @@
 - [x] Allow to run commands in parallel
 - [x] Allow to choose the user to run the command
 - [x] Allow to choose the working directory
-- [ ] Allow to choose the environment variables
+- [x] Allow to choose the environment variables
 - [x] Simpler syntax for scheduling, ej. every 2 hours, at 12:00, only on monday, etc.
 - [ ] Global configuration file, with option override single config options in a different file
 - [x] Limit execution time of task
-- [x] Show schedule of tasks
+- [ ] Show schedule of tasks
 - [ ] Allow to run a task manually
 - [ ] Allow to run a task only once, execute today at 8:30
 - [ ] Execute or not based on condition, ej. only if a file exists
@@ -25,4 +25,15 @@
 - [x] Support cron syntax (GenerateFromCrontab create config file from crontab)
 - [ ] Log format: sqlite table (not only logs, but tracking execution time, errors and other metadata so it can be queried)
 - [ ] Run inside docker container or run as a service
-- [ ] // TODO replace min interval for event loop with setInterval for each individual task
+- [x] replace min interval for event loop with setInterval for each individual task
+- [ ] retries on error
+- [ ] subtasks
+- [x] on_complete notification
+- [x] alerts
+- [ ] hot reload config
+- [ ] conditional exec if file exists
+- [ ] execution delay when the parallel execution is not allowed and an execution is already running
+- [ ] use env vars from .env file in config
+- [ ] load secrets from file
+- [ ] warning if config file is readable/writable by other users
+- [ ] custom validation for task success state
