@@ -16,6 +16,12 @@ A Rust-based task scheduler that allows you to run commands at specified times u
 - Time limits for tasks
 - Environment variable support
 - Run as different user
+- Alert system for task failures (email, webhook, command)
+- Support for cron syntax conversion
+- Multiple config file locations support
+- Task execution time measurement
+- Shell customization
+- Parallel task execution
 
 ## Installation
 
@@ -31,18 +37,32 @@ cargo install --path .
 cron-rs generate-config > config.yml
 ```
 
-
 2. Run the scheduler:
 
 ```bash
-cron-rs --config config.yml
+cron-rs run
 ```
 
 3. Validate your configuration:
 
 ```bash
-cron-rs --config config.yml --validate
+cron-rs validate ./config.yml
 ```
+
+4. Convert from existing crontab configuration:
+
+```bash
+cron-rs generate-from-crontab > config.yml
+```
+
+## Configuration File Locations
+
+The scheduler will look for configuration files in the following locations (in order):
+
+1. Path specified with `--config` argument
+2. `./config.yml` in current directory
+3. `$XDG_CONFIG_HOME/cron-rs/config.yml` or `$HOME/.config/cron-rs/config.yml`
+4. `/etc/cron-rs.yml`
 
 ## Task Configuration Options
 
@@ -57,6 +77,7 @@ cron-rs --config config.yml --validate
 - `time_limit`: Maximum execution time in seconds (optional)
 - `env`: Environment variables for the task (optional)
 - `run_as`: User to run the task as (optional)
+- `shell`: Shell to use for command execution (optional, defaults to /bin/sh)
 
 ### Scheduling Options
 You can use either `when` or `every` to specify when a task should run:
@@ -76,6 +97,36 @@ when:
 #### Using `every`:
 ```yaml
 every: "5 minutes"  # or "1 hour", "2 days", etc.
+```
+
+### Alert Configuration
+
+You can configure alerts to be sent when tasks fail:
+
+```yaml
+alerts:
+  on_failure:
+    # Email alert
+    - type: email
+      to: 'admin@example.com'
+      subject: 'Task failed'
+      body: 'The task {{ task_name }} failed with exit code {{ exit_code }}'
+      smtp_server: 'smtp.example.com'
+      smtp_port: 587
+      smtp_username: 'user@example.com'
+      smtp_password: 'password'
+
+    # Command alert
+    - type: cmd
+      cmd: 'mail -s "Task failed" admin@example.com'
+
+    # Webhook alert
+    - type: webhook
+      url: 'https://example.com/webhook'
+      method: POST
+      body: '{"task_name": "{{ task_name }}", "exit_code": "{{ exit_code }}"}'
+      headers:
+        Content-Type: application/json
 ```
 
 ### Time Limits
@@ -121,8 +172,8 @@ Note: The scheduler must have sufficient permissions to run commands as the spec
 ## Output Redirection
 
 By default, task output is redirected to files in a `.tmp` directory:
-- Standard output goes to `.tmp/stdout.log`
-- Standard error goes to `.tmp/stderr.log`
+- Standard output goes to `.tmp/{task_name}_stdout.log`
+- Standard error goes to `.tmp/{task_name}_stderr.log`
 
 You can customize these paths using the `stdout` and `stderr` options:
 
@@ -137,7 +188,7 @@ tasks:
 
 ## Working Directory
 
-Tasks run in the current directory by default. You can specify a different working directory using the `runtime_dir` option:
+Tasks run in the current directory by default. You can specify a different working directory using the `working_directory` option:
 
 ```yaml
 tasks:
@@ -226,7 +277,6 @@ when: '[Mon,Tue] *-*/2-01..04 12:00:00'
 - `01..04`: Days 1 through 4 of the month
 - `12:00:00`: At exactly 12:00:00 (noon)
 
-
 #### Pattern Syntax
 
 - `*`: Matches any value (wildcard)
@@ -237,7 +287,6 @@ when: '[Mon,Tue] *-*/2-01..04 12:00:00'
 
 You can combine these patterns for powerful scheduling flexibility.
 
-
 ## Timezone Support
 
 You can specify a timezone for each task using the `timezone` field:
@@ -246,4 +295,4 @@ You can specify a timezone for each task using the `timezone` field:
 timezone: 'Europe/Madrid'
 ```
 
-If not defined, it will use the system's default
+If not defined, it will use the system's default timezone.
