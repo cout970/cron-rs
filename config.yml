@@ -45,6 +45,22 @@ tasks:
 #    when: '* *-*-* *:*:*/2'
     time_limit: 2s
     shell: '/usr/bin/fish'
+    on_success:
+      # Execute a command when a task success
+      - type: cmd
+        cmd: |
+          cat <<- EOF >> .tmp/succeed2.txt
+          task_name: '{{ task_name }}'
+          exit_code: '{{ exit_code }}'
+          start_time: '{{ start_time }}'
+          duration: '{{ duration }}'
+          end_time: '{{ end_time }}'
+          error_message: '{{ error_message }}'
+          debug_info: '{{ debug_info }}'
+          stdout: '{{ stdout }}'
+          stderr: '{{ stderr }}'
+          ---
+          EOF
 
 #  - name: Task1
 #    cmd: echo 'hello'

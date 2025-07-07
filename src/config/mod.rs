@@ -26,7 +26,7 @@ use self::timeunit::TimeUnit;
 use log::warn;
 use std::collections::HashMap;
 use std::time::Duration;
-use crate::alerts::AlertConfig;
+use crate::alerts::{Alert, AlertConfig};
 
 #[derive(Debug, Clone)]
 pub struct TaskConfig {
@@ -42,6 +42,8 @@ pub struct TaskConfig {
     pub shell: Option<String>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+    pub on_failure: Vec<Alert>,
+    pub on_success: Vec<Alert>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +148,8 @@ impl TaskConfig {
             env: config.env.clone(),
             stdout: config.stdout.clone(),
             stderr: config.stderr.clone(),
+            on_failure: config.on_failure.clone(),
+            on_success: config.on_success.clone()
         })
     }
 }

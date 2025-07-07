@@ -1,4 +1,4 @@
-use crate::alerts::{send_alert, AlertConfig, TaskExecutionDetails};
+use crate::alerts::{send_alert, Alert, AlertConfig, TaskExecutionDetails};
 use crate::config::{Config, Schedule, TaskConfig, TimePatternField};
 use crate::utils::format_duration;
 use anyhow::anyhow;
@@ -525,7 +525,7 @@ impl Scheduler {
                     stderr: e.to_string(),
                 };
 
-                Self::on_task_failure(&details, alerts).await;
+                Self::on_task_failure(&details, alerts, &task.config.on_failure).await;
 
                 Err(anyhow!(
                     "Task '{}' failed to start: {}, Debug info:\n{}",
@@ -559,7 +559,7 @@ impl Scheduler {
                 task.config.name, exit_code, status
             );
 
-            Self::on_task_failure(&details, &config.alerts).await;
+            Self::on_task_failure(&details, &config.alerts, &task.config.on_failure).await;
         } else {
             info!(
                 "Task '{}' finished with status: {}, elapsed {}",
@@ -568,24 +568,34 @@ impl Scheduler {
                 format_duration(execution_time)
             );
 
-            Self::on_task_success(&details, &config.alerts).await;
+            Self::on_task_success(&details, &config.alerts, &task.config.on_success).await;
         }
     }
 
     /// Notify the user about task failure
-    async fn on_task_failure(details: &TaskExecutionDetails, alerts: &AlertConfig) {
+    async fn on_task_failure(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_failure: &[Alert]) {
         for alert in &alerts.on_failure {
             if let Err(e) = send_alert(alert, details) {
                 error!("Failed to send alert for task '{}': {}", details.task_name, e);
             }
         }
+        for alert in task_on_failure {
+            if let Err(e) = send_alert(alert, details) {
+                error!("Failed to send task-specific alert for task '{}': {}", details.task_name, e);
+            }
+        }
     }
 
     /// Notify the user about task success
-    async fn on_task_success(details: &TaskExecutionDetails, alerts: &AlertConfig) {
+    async fn on_task_success(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_success: &[Alert]) {
         for alert in &alerts.on_success {
             if let Err(e) = send_alert(alert, details) {
                 error!("Failed to send alert for task '{}': {}", details.task_name, e);
+            }
+        }
+        for alert in task_on_success {
+            if let Err(e) = send_alert(alert, details) {
+                error!("Failed to send task-specific alert for task '{}': {}", details.task_name, e);
             }
         }
     }

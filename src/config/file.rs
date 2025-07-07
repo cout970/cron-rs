@@ -4,7 +4,7 @@ use serde_with::skip_serializing_none;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::ops::Not;
-use crate::alerts::AlertConfig;
+use crate::alerts::{Alert, AlertConfig};
 use super::logging::LoggingConfig;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -42,6 +42,10 @@ pub struct TaskDefinition {
     pub stdout: Option<String>,
     #[serde(default)]
     pub stderr: Option<String>,
+    #[serde(default)]
+    pub on_failure: Vec<Alert>,
+    #[serde(default)]
+    pub on_success: Vec<Alert>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

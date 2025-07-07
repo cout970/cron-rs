@@ -99,3 +99,8 @@ tasks:
     
     ## Pipe the command's stderr to a file, by default the output is stored in .tmp/{task_name}_stderr.log
     # stderr: 'output.log'
+
+    ## Define the commands to run when the task succeeds or fails, this is useful to run additional commands after the main command
+    ## Uses the same variables as the global [alerts] section
+    # on_success: []
+    # on_failure: []
