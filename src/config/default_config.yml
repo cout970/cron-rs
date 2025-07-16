@@ -3,6 +3,11 @@ logging:
   output: stdout # stdout, file or syslog
   # file: /var/log/cron-rs.log # if output is file, the path to the file
   level: info # debug, info, warning, error, critical
+  
+  # SQLite logging configuration (optional)
+  # sqlite:
+  #   enabled: true
+  #   database_path: "/var/log/cron_execution_logs.db"
 
 # Define alerts to send when tasks fail
 alerts:

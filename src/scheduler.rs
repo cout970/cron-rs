@@ -1,5 +1,6 @@
 use crate::alerts::{send_alert, Alert, AlertConfig, TaskExecutionDetails};
 use crate::config::{Config, Schedule, TaskConfig, TimePatternField};
+use crate::sqlite_logger::{ExecutionAttempt, ExecutionFailure, ExecutionSuccess, SqliteLogger};
 use crate::utils::format_duration;
 use anyhow::anyhow;
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Timelike};
@@ -54,6 +55,7 @@ pub struct Scheduler {
     running_tasks: Vec<PendingTask>,
     async_handles: Vec<JoinHandle<()>>,
     config: Config,
+    sqlite_logger: Option<SqliteLogger>,
 }
 
 impl Scheduler {
@@ -64,6 +66,7 @@ impl Scheduler {
             running_tasks: Vec::new(),
             async_handles: Vec::new(),
             config,
+            sqlite_logger: None,
         }
     }
 
@@ -76,6 +79,23 @@ impl Scheduler {
     }
 
     async fn run_async(mutex: Arc<Mutex<Scheduler>>) -> anyhow::Result<()> {
+        // Initialize SQLite logger if configured
+        {
+            let mut scheduler = mutex.lock().await;
+            if let Some(sqlite_config) = &scheduler.config.logging.sqlite {
+                if sqlite_config.enabled {
+                    match SqliteLogger::new(sqlite_config.clone()).await {
+                        Ok(logger) => {
+                            scheduler.sqlite_logger = Some(logger);
+                        },
+                        Err(e) => {
+                            error!("Failed to initialize SQLite logger: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         let tasks_config = {
             let scheduler = mutex.lock().await;
             scheduler.tasks.clone()
@@ -122,11 +142,11 @@ impl Scheduler {
                     }
 
                     // Execute the task
-                    let alert_config = {
+                    let (alert_config, config, sqlite_logger) = {
                         let scheduler = scheduler_mutex.lock().await;
-                        scheduler.config.alerts.clone()
+                        (scheduler.config.alerts.clone(), scheduler.config.clone(), scheduler.sqlite_logger.clone())
                     };
-                    let active_task = match Self::execute_task(&pending_task, &alert_config).await {
+                    let active_task = match Self::execute_task(&pending_task, &alert_config, &config, &sqlite_logger).await {
                         Ok(active_task) => active_task,
                         Err(e) => {
                             error!("{}", e);
@@ -231,7 +251,8 @@ impl Scheduler {
 
                 let mut active_task = scheduler.active_tasks.remove(active_task_index);
 
-                Self::on_task_completed(&active_task, exit_status, &scheduler.config).await;
+                let sqlite_logger = scheduler.sqlite_logger.clone();
+                Self::on_task_completed(&active_task, exit_status, &scheduler.config, &sqlite_logger).await;
             }
         });
 
@@ -348,7 +369,7 @@ impl Scheduler {
     }
 
     /// Spawns a subprocess to execute the task
-    async fn execute_task(task: &PendingTask, alerts: &AlertConfig) -> anyhow::Result<ActiveTask> {
+    async fn execute_task(task: &PendingTask, alerts: &AlertConfig, config: &Config, sqlite_logger: &Option<SqliteLogger>) -> anyhow::Result<ActiveTask> {
         let stdout_path = if let Some(path) = task.config.stdout.as_deref() {
             PathBuf::from(path)
         } else {
@@ -490,10 +511,31 @@ impl Scheduler {
         match cmd.spawn() {
             Ok(child) => {
                 let pid = child.id().unwrap_or(0);
+                let task_id = ACTIVE_TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
                 info!("Task '{}' started with PID: {}", task.config.name, pid);
 
+                // Log execution attempt to SQLite
+                if let Some(sqlite_logger) = sqlite_logger {
+                    let attempt = ExecutionAttempt {
+                        task_name: task.config.name.clone(),
+                        task_id,
+                        pid,
+                        cmd: task.config.cmd.clone(),
+                        start_time: clock_time,
+                        timezone: task.config.timezone.to_string(),
+                        working_directory: task.config.working_directory.clone(),
+                        shell: task.config.shell.clone(),
+                        run_as: task.config.run_as.clone(),
+                        time_limit: task.config.time_limit,
+                    };
+                    
+                    if let Err(e) = sqlite_logger.log_execution_attempt(&attempt).await {
+                        error!("Failed to log execution attempt for task '{}': {}", task.config.name, e);
+                    }
+                }
+
                 Ok(ActiveTask {
-                    id: ACTIVE_TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u32,
+                    id: task_id,
                     config: task.config.clone(),
                     pid,
                     start_instant: now,
@@ -516,6 +558,8 @@ impl Scheduler {
 
                 let details = TaskExecutionDetails {
                     task_name: task.config.name.to_string(),
+                    task_id: 0,
+                    pid: 0,
                     exit_code: -1,
                     start_time: clock_time,
                     duration: Duration::default(),
@@ -525,7 +569,7 @@ impl Scheduler {
                     stderr: e.to_string(),
                 };
 
-                Self::on_task_failure(&details, alerts, &task.config.on_failure).await;
+                Self::on_task_failure(&details, alerts, &task.config.on_failure, sqlite_logger).await;
 
                 Err(anyhow!(
                     "Task '{}' failed to start: {}, Debug info:\n{}",
@@ -538,12 +582,14 @@ impl Scheduler {
     }
 
     /// Handle the task completion
-    async fn on_task_completed(task: &ActiveTask, status: ExitStatus, config: &Config) {
+    async fn on_task_completed(task: &ActiveTask, status: ExitStatus, config: &Config, sqlite_logger: &Option<SqliteLogger>) {
         let exit_code = status.code().unwrap_or(-1);
         let execution_time = task.start_instant.elapsed();
 
         let details = TaskExecutionDetails {
             task_name: task.config.name.to_string(),
+            task_id: task.id,
+            pid: task.pid,
             exit_code,
             start_time: task.start_time,
             duration: execution_time,
@@ -559,7 +605,7 @@ impl Scheduler {
                 task.config.name, exit_code, status
             );
 
-            Self::on_task_failure(&details, &config.alerts, &task.config.on_failure).await;
+            Self::on_task_failure(&details, &config.alerts, &task.config.on_failure, sqlite_logger).await;
         } else {
             info!(
                 "Task '{}' finished with status: {}, elapsed {}",
@@ -568,12 +614,12 @@ impl Scheduler {
                 format_duration(execution_time)
             );
 
-            Self::on_task_success(&details, &config.alerts, &task.config.on_success).await;
+            Self::on_task_success(&details, &config.alerts, &task.config.on_success, sqlite_logger).await;
         }
     }
 
     /// Notify the user about task failure
-    async fn on_task_failure(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_failure: &[Alert]) {
+    async fn on_task_failure(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_failure: &[Alert], sqlite_logger: &Option<SqliteLogger>) {
         for alert in &alerts.on_failure {
             if let Err(e) = send_alert(alert, details) {
                 error!("Failed to send alert for task '{}': {}", details.task_name, e);
@@ -584,10 +630,28 @@ impl Scheduler {
                 error!("Failed to send task-specific alert for task '{}': {}", details.task_name, e);
             }
         }
+
+        if let Some(sqlite_logger) = sqlite_logger {
+            let failure = ExecutionFailure {
+                task_name: details.task_name.clone(),
+                task_id: details.task_id,
+                pid: details.pid,
+                start_time: details.start_time,
+                end_time: details.start_time + chrono::Duration::from_std(details.duration).unwrap_or_default(),
+                duration_seconds: details.duration.as_secs_f64(),
+                exit_code: if details.exit_code == -1 { None } else { Some(details.exit_code) },
+                error_message: details.error_message.clone(),
+                failure_reason: "Task execution failed".to_string(),
+            };
+            
+            if let Err(e) = sqlite_logger.log_execution_failure(&failure).await {
+                error!("Failed to log execution failure for task '{}': {}", details.task_name, e);
+            }
+        }
     }
 
     /// Notify the user about task success
-    async fn on_task_success(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_success: &[Alert]) {
+    async fn on_task_success(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_success: &[Alert], sqlite_logger: &Option<SqliteLogger>) {
         for alert in &alerts.on_success {
             if let Err(e) = send_alert(alert, details) {
                 error!("Failed to send alert for task '{}': {}", details.task_name, e);
@@ -596,6 +660,22 @@ impl Scheduler {
         for alert in task_on_success {
             if let Err(e) = send_alert(alert, details) {
                 error!("Failed to send task-specific alert for task '{}': {}", details.task_name, e);
+            }
+        }
+
+        if let Some(sqlite_logger) = sqlite_logger {
+            let success = ExecutionSuccess {
+                task_name: details.task_name.clone(),
+                task_id: details.task_id,
+                pid: details.pid,
+                start_time: details.start_time,
+                end_time: details.start_time + chrono::Duration::from_std(details.duration).unwrap_or_default(),
+                duration_seconds: details.duration.as_secs_f64(),
+                exit_code: details.exit_code,
+            };
+            
+            if let Err(e) = sqlite_logger.log_execution_success(&success).await {
+                error!("Failed to log execution success for task '{}': {}", details.task_name, e);
             }
         }
     }

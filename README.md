@@ -11,6 +11,7 @@ It supports YAML-based configuration, flexible scheduling syntax, and various ou
 - Command execution
 - Config validation
 - Configurable logging (stdout, file, or syslog)
+- SQLite execution logging for detailed analysis and monitoring
 - Concurrent execution prevention
 - Custom working directory
 - Configurable output redirection

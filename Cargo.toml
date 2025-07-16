@@ -1,6 +1,6 @@
 [package]
 name = "cron-rs"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 
 [dependencies]
@@ -25,5 +25,6 @@ reqwest = { version = "0.12.19", features = ["blocking"] }
 openssl = { version = "0.10", features = ["vendored"] }
 tokio = { version = "1.36.0", features = ["full"] }
 regex = { version = "1.11.1", features = [] }
+libsql = "0.9.16"
 
 [profile.release]

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use crate::sqlite_logger::SqliteLoggerConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, Ord, PartialOrd, Eq, PartialEq)]
 pub enum LogOutput {
@@ -18,6 +19,8 @@ pub struct LoggingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<PathBuf>,
     pub level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<SqliteLoggerConfig>,
 }
 
 impl Default for LoggingConfig {
@@ -26,6 +29,7 @@ impl Default for LoggingConfig {
             output: LogOutput::Stdout,
             file: None,
             level: "info".to_string(),
+            sqlite: None,
         }
     }
 } 

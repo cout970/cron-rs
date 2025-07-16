@@ -3,6 +3,7 @@
 mod config;
 mod logging;
 mod scheduler;
+mod sqlite_logger;
 
 mod alerts;
 

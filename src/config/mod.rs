@@ -27,6 +27,7 @@ use log::warn;
 use std::collections::HashMap;
 use std::time::Duration;
 use crate::alerts::{Alert, AlertConfig};
+use crate::sqlite_logger::SqliteLoggerConfig;
 
 #[derive(Debug, Clone)]
 pub struct TaskConfig {
@@ -93,9 +94,11 @@ pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
         tasks.push(task);
     }
 
+    let logging_config = file.logging.clone().unwrap_or_default();
+
     Ok(Config {
         tasks,
-        logging: file.logging.clone().unwrap_or_default(),
+        logging: logging_config,
         alerts: file.alerts.clone().unwrap_or_default(),
     })
 }

@@ -57,6 +57,8 @@ pub enum Alert {
 
 pub struct TaskExecutionDetails {
     pub task_name: String,
+    pub task_id: u32,
+    pub pid: u32,
     pub exit_code: i32,
     pub start_time: DateTime<Utc>,
     pub duration: Duration,
