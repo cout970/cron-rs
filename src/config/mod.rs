@@ -15,7 +15,7 @@ use nom::combinator::{all_consuming, map, map_res, opt, value};
 use nom::error::ParseError;
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, preceded, separated_pair, tuple};
-use nom::{AsChar, IResult, InputTakeAtPosition, Parser};
+use nom::{error, AsChar, IResult, InputTakeAtPosition, Parser};
 
 use self::dayofweek::DayOfWeek;
 use self::file::ExplodedTimePatternFieldConfig;
@@ -25,6 +25,7 @@ use self::timeunit::TimeUnit;
 
 use log::warn;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::time::Duration;
 use crate::alerts::{Alert, AlertConfig};
 use crate::sqlite_logger::SqliteLoggerConfig;
@@ -47,7 +48,7 @@ pub struct TaskConfig {
     pub on_success: Vec<Alert>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub tasks: Vec<TaskConfig>,
     pub logging: LoggingConfig,
@@ -56,7 +57,7 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub enum Schedule {
-    Every { interval: Duration },
+    Every { interval: Duration, aligned: bool },
     When { time: TimePattern },
 }
 
@@ -77,7 +78,7 @@ pub struct TimePattern {
 pub enum TimePatternField {
     Any,             // * or missing
     Value(u32),      // 12
-    Range(u32, u32), // 01..04
+    Range(u32, u32), // 01..04 or 01..=04
     List(Vec<u32>),  // [Mon,Tue]
     Ratio(u32, u32), // */5+2
 }
@@ -129,7 +130,7 @@ impl TaskConfig {
         };
 
         let time_limit = if let Some(def) = &config.time_limit {
-            let duration = Schedule::parse_time_duration(def)?;
+            let duration = Schedule::parse_time_duration(def)?.0;
             if duration.as_secs() < 1 {
                 warn!("Task '{}': cannot have a time limit of less than 1 second. Changed to 1 second", config.name);
             }
@@ -158,21 +159,30 @@ impl TaskConfig {
 }
 
 impl Schedule {
-    fn parse_time_duration(input: &str) -> Result<Duration> {
-        let amount_unit = separated_pair(number, space0, TimeUnit::parse);
-        let line = delimited(space0, amount_unit, space0);
+    fn parse_time_duration(input: &str) -> Result<(Duration, bool)> {
+        pub fn parse_line<'s>() -> impl FnMut(&'s str) -> IResult<&'s str, (u32, TimeUnit, bool), error::Error<&'s str>>
+        {
+            move |input: &str| {
+                let (input, _) = space0.parse(input)?;
+                let (input, o2) = separated_pair(number, space0, TimeUnit::parse).parse(input)?;
+                let (input, _) = space0.parse(input)?;
+                let (input, o3) = opt(tag("aligned")).parse(input)?;
 
-        let result = all_consuming(line)(input);
+                Ok((input, (o2.0, o2.1, o3.is_some())))
+            }
+        }
 
-        let (amount, unit) = result.map_err(|e| anyhow!("Failed to parse: {}", e))?.1;
+        let result = all_consuming(parse_line())(input);
 
-        Ok(unit.to_duration(amount))
+        let (amount, unit, aligned) = result.map_err(|e| anyhow!("Failed to parse: {}", e))?.1;
+        let interval = unit.to_duration(amount);
+
+        Ok((interval, aligned))
     }
 
     fn parse_every(input: &str) -> Result<Self> {
-        Ok(Self::Every {
-            interval: Self::parse_time_duration(input)?,
-        })
+        let (interval, aligned) = Self::parse_time_duration(input)?;
+        Ok(Self::Every { interval, aligned })
     }
 
     fn parse_when(config: &TimePatternConfig) -> Result<Self> {
@@ -238,7 +248,7 @@ impl TimePatternField {
     
     /// Returns a tuple with the next valid value and 1 if the value requires wrapping, 0 if it doesn't
     pub fn get_next_valid_value(&self, the_value: u32, limit: u32) -> (u32, u32) {
-        let value = (the_value + limit) % limit;
+        let value = the_value % limit;
         match self {
             TimePatternField::Any => (value, 0),
             TimePatternField::Value(v) => {
@@ -319,6 +329,32 @@ impl TimePatternField {
         let res = all_consuming(shorthand::single_field(allow_dow))(i);
         let (_, field) = res.map_err(|e| anyhow!("{}", e))?;
         Ok(field)
+    }
+}
+
+impl Display for TimePattern {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}-{}-{} {}:{}:{}",
+               &self.day_of_week,
+               &self.year,
+               &self.month,
+               &self.day,
+               &self.hour,
+               &self.minute,
+               &self.second
+        )
+    }
+}
+
+impl Display for TimePatternField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimePatternField::Any => write!(f, "*"),
+            TimePatternField::Value(v) => write!(f, "{}", v),
+            TimePatternField::Range(start, end) => write!(f,"{}..{}", start, end),
+            TimePatternField::List(values) => write!(f,"[{}]", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")),
+            TimePatternField::Ratio(divisor, offset) => write!(f,"*/{}", divisor),
+        }
     }
 }
 

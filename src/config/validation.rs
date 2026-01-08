@@ -111,7 +111,7 @@ pub fn validate_config(conf: &ConfigFile) -> Vec<ValidationResult> {
                 )));
             }
             // Validate time_limit is not too short
-            if let Ok(duration) = Schedule::parse_time_duration(limit) {
+            if let Ok((duration, _)) = Schedule::parse_time_duration(limit) {
                 if duration < Duration::from_secs(1) {
                     result.push(ValidationResult::Error(format!(
                         "Task '{}': time_limit must be at least 1 second",
@@ -334,12 +334,9 @@ fn validate_alerts_config(conf: &ConfigFile) -> Vec<ValidationResult> {
             Alert::Email {
                 from,
                 to,
-                subject,
-                body,
                 smtp_server,
                 smtp_port,
-                smtp_username,
-                smtp_password,
+                ..
             } => {
                 match to.parse::<Mailbox>() {
                     Ok(_) => {}
@@ -395,8 +392,7 @@ fn validate_alerts_config(conf: &ConfigFile) -> Vec<ValidationResult> {
             Alert::Webhook {
                 url,
                 method,
-                body,
-                headers,
+                ..
             } => {
                 if url.is_empty() {
                     result.push(ValidationResult::Error(

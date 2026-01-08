@@ -4,6 +4,8 @@ mod config;
 mod logging;
 mod scheduler;
 mod sqlite_logger;
+mod task_executor;
+mod schedule_display;
 
 mod alerts;
 
@@ -17,6 +19,9 @@ use crate::config::file::TaskDefinition;
 use crate::config::file::TimePatternConfig;
 use crate::config::logging::LoggingConfig;
 use crate::scheduler::Scheduler;
+use crate::schedule_display::ScheduleDisplay;
+use crate::sqlite_logger::SqliteLogger;
+use crate::task_executor::TaskExecutor;
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
 use config::file::read_config_file;
@@ -45,6 +50,20 @@ enum ArgCmd {
     Validate {
         /// Path to the config file to validate
         path: Option<PathBuf>,
+    },
+    /// Execute a specific task immediately
+    ExecuteTask {
+        /// Name of the task to execute
+        task_name: String,
+        /// Path to the config file (optional)
+        #[arg(long, short)]
+        config: Option<PathBuf>,
+    },
+    /// Show the schedule for all tasks
+    ShowSchedule {
+        /// Path to the config file (optional)
+        #[arg(long, short)]
+        config: Option<PathBuf>,
     },
     /// Write the default config file in ./default_config.yml
     GenerateConfig {
@@ -79,6 +98,24 @@ fn main() -> anyhow::Result<()> {
                 get_config_path(args.config)?
             };
             cmd_validate_config_file(path)?;
+            Ok(())
+        }
+        ArgCmd::ExecuteTask { task_name, config } => {
+            let config_path = if let Some(config) = config {
+                config
+            } else {
+                get_config_path(args.config)?
+            };
+            cmd_execute_task(config_path, task_name)?;
+            Ok(())
+        }
+        ArgCmd::ShowSchedule { config } => {
+            let config_path = if let Some(config) = config {
+                config
+            } else {
+                get_config_path(args.config)?
+            };
+            cmd_show_schedule(config_path)?;
             Ok(())
         }
         ArgCmd::GenerateConfig { output } => {
@@ -136,6 +173,73 @@ fn cmd_run(config_path: PathBuf) -> anyhow::Result<()> {
     Scheduler::new(config).run();
 
     info!("Exiting");
+    Ok(())
+}
+
+fn cmd_execute_task(config_path: PathBuf, task_name: String) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let config_file = read_config_file(&config_path)?;
+        let config = parse_config_file(&config_file)?;
+        
+        // Find the task
+        let task = config.tasks.iter().find(|t| t.name == task_name)
+            .ok_or_else(|| anyhow!("Task '{}' not found", task_name))?;
+        
+        // Initialize SQLite logger if configured
+        let sqlite_logger = if let Some(sqlite_config) = &config.logging.sqlite {
+            if sqlite_config.enabled {
+                match SqliteLogger::new(sqlite_config.clone()).await {
+                    Ok(logger) => Some(logger),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize SQLite logger: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Create task executor
+        let executor = TaskExecutor::new(config.alerts, sqlite_logger);
+        
+        // Execute the task
+        println!("Executing task '{}'...", task_name);
+        match executor.execute_task(task).await {
+            Ok(result) => {
+                println!("Task '{}' completed:", task_name);
+                println!("  Status: {}", if result.success { "Success" } else { "Failed" });
+                println!("  Exit code: {}", result.exit_code);
+                println!("  Duration: {}", crate::utils::format_duration(result.duration));
+                println!("  PID: {}", result.pid);
+                
+                if !result.stdout.is_empty() {
+                    println!("  Stdout: {}", result.stdout.trim());
+                }
+                if !result.stderr.is_empty() {
+                    println!("  Stderr: {}", result.stderr.trim());
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to execute task '{}': {}", task_name, e);
+                std::process::exit(1);
+            }
+        }
+        
+        Ok(())
+    })
+}
+
+fn cmd_show_schedule(config_path: PathBuf) -> anyhow::Result<()> {
+    let config_file = read_config_file(&config_path)?;
+    let config = parse_config_file(&config_file)?;
+    
+    let schedule_display = ScheduleDisplay::display_schedules(&config);
+    println!("{}", schedule_display);
+    
     Ok(())
 }
 

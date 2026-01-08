@@ -26,11 +26,12 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
-struct PendingTask {
-    config: TaskConfig,
-    last_execution: Option<Instant>,
-    last_pid: Option<u32>,
-    retries: u32,
+pub struct PendingTask {
+    pub config: TaskConfig,
+    pub last_execution: Option<Instant>,
+    pub last_execution_time: Option<DateTime<Utc>>,
+    pub last_pid: Option<u32>,
+    pub retries: u32,
 }
 
 static ACTIVE_TASK_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -87,7 +88,7 @@ impl Scheduler {
                     match SqliteLogger::new(sqlite_config.clone()).await {
                         Ok(logger) => {
                             scheduler.sqlite_logger = Some(logger);
-                        },
+                        }
                         Err(e) => {
                             error!("Failed to initialize SQLite logger: {}", e);
                         }
@@ -108,12 +109,7 @@ impl Scheduler {
             let scheduler_mutex = mutex.clone();
 
             let handle = tokio::spawn(async move {
-                let mut pending_task = PendingTask {
-                    config: task_config,
-                    last_execution: None,
-                    last_pid: None,
-                    retries: 0,
-                };
+                let mut pending_task = PendingTask::new(task_config);
 
                 // Wait loop for the right time to execute the task
                 loop {
@@ -144,17 +140,23 @@ impl Scheduler {
                     // Execute the task
                     let (alert_config, config, sqlite_logger) = {
                         let scheduler = scheduler_mutex.lock().await;
-                        (scheduler.config.alerts.clone(), scheduler.config.clone(), scheduler.sqlite_logger.clone())
+                        (
+                            scheduler.config.alerts.clone(),
+                            scheduler.config.clone(),
+                            scheduler.sqlite_logger.clone(),
+                        )
                     };
-                    let active_task = match Self::execute_task(&pending_task, &alert_config, &config, &sqlite_logger).await {
-                        Ok(active_task) => active_task,
-                        Err(e) => {
-                            error!("{}", e);
-                            continue;
-                        }
-                    };
+                    let active_task =
+                        match Self::execute_task(&pending_task, &alert_config, &config, &sqlite_logger).await {
+                            Ok(active_task) => active_task,
+                            Err(e) => {
+                                error!("{}", e);
+                                continue;
+                            }
+                        };
 
                     pending_task.last_execution = Some(active_task.start_instant);
+                    pending_task.last_execution_time = Some(active_task.start_time);
                     pending_task.last_pid = Some(active_task.pid);
 
                     let task_id = active_task.id;
@@ -167,9 +169,18 @@ impl Scheduler {
                     // Wait for the task to finish
                     Self::wait_for_task(scheduler_mutex.clone(), task_id).await;
 
-                    // Sleep at least for a second to avoid running the task multiple times the same second
+                    // Sleep at least to the next second to avoid running the task multiple times the same datetime
                     if start.elapsed().as_secs() < 1 {
-                        sleep(Duration::from_secs(1)).await;
+                        // Sleeping a hole second makes the time drifts slowly, by sleeping only the
+                        // millis needed to jump to the next second, we mostly eliminate the drift
+                        let next_second =
+                            Self::get_current_datetime_at(pending_task.config.timezone) + TimeDelta::seconds(1);
+                        let current_second = Self::get_precise_datetime_at(pending_task.config.timezone);
+
+                        // Get the number of milliseconds to the next second
+                        let diff = next_second.signed_duration_since(current_second).num_milliseconds() as u64;
+
+                        sleep(Duration::from_millis(diff)).await;
                     }
                 }
             });
@@ -262,22 +273,36 @@ impl Scheduler {
         }
     }
 
+    /// Returns the current time rounded in a way that has no fractional seconds
+    pub fn get_current_datetime_at(timezone: Tz) -> DateTime<Tz> {
+        // Rounds the time, by flooring it to the second, to avoid issues with comparisons of dates and rounding
+        timezone
+            .from_utc_datetime(&Utc::now().naive_utc())
+            .with_nanosecond(0)
+            .unwrap()
+    }
+
+    /// Gets the current time in the given timezone, with full precision (including fractional seconds)
+    pub fn get_precise_datetime_at(timezone: Tz) -> DateTime<Tz> {
+        timezone.from_utc_datetime(&Utc::now().naive_utc())
+    }
+
     async fn sleep_until_task_is_ready(task: &PendingTask) {
-        let date: DateTime<Tz> = task.config.timezone.from_utc_datetime(&Utc::now().naive_utc());
+        let precise_now = Self::get_precise_datetime_at(task.config.timezone);
+        let now: DateTime<Tz> = Self::get_current_datetime_at(task.config.timezone);
 
         // Use the current datetime plus 1 second to avoid returning the exact same value
-        let next_run = Self::get_next_execution_time(&task, date);
-        let wait_time = next_run.signed_duration_since(date);
+        let next_run = Self::get_next_execution_time(&task, now);
+        let wait_time = next_run.signed_duration_since(precise_now);
 
         debug!(
             "Task '{}' planned next execution at {} (current time {}, around {} s later)",
             task.config.name,
             next_run,
-            date,
+            now,
             (wait_time.num_milliseconds() as f32 / 1000.0f32).max(0f32)
         );
 
-        let pre = Instant::now();
         let duration = if wait_time.num_milliseconds() > 1000 {
             // Wait the remaining time, minus 1 second, to account for the imprecision of sleep()
             Duration::from_millis(wait_time.num_milliseconds() as u64 - 1000u64)
@@ -293,67 +318,18 @@ impl Scheduler {
 
     /// Checks if the task is ready for execution right now
     fn is_task_ready_for_execution(task: &PendingTask) -> bool {
-        let now = Instant::now();
-        let date: DateTime<Tz> = task.config.timezone.from_utc_datetime(&Utc::now().naive_utc());
+        let now: DateTime<Tz> = Self::get_current_datetime_at(task.config.timezone);
 
-        match &task.config.schedule {
-            Schedule::Every { interval } => {
-                if let Some(last_execution) = task.last_execution {
-                    let elapsed = now.duration_since(last_execution);
-                    let should_run = elapsed >= *interval;
-                    debug!(
-                        "Task '{}' run every {}, time since last run: {}",
-                        task.config.name,
-                        format_duration(*interval),
-                        format_duration(elapsed)
-                    );
-                    should_run
-                } else {
-                    // Try to align the execution to the start of the next second
-                    let mut next_date = date.add(TimeDelta::seconds(1));
-                    next_date = next_date.with_nanosecond(0).unwrap_or(next_date);
-                    let wait_time = next_date.signed_duration_since(date);
-
-                    // If less than 50 ms to the next run, run instantly
-                    let run_now = wait_time.num_milliseconds() <= 50 || wait_time.num_milliseconds() >= (1000 - 50);
-                    if run_now {
-                        debug!("Task '{}' first execution", task.config.name);
-                    } else {
-                        debug!(
-                            "Task '{}' is waiting for first run ({} ms)",
-                            task.config.name,
-                            wait_time.num_milliseconds()
-                        );
-                    }
-                    run_now
-                }
-            }
-            Schedule::When { time } => {
-                let second = date.second();
-                let minute = date.minute();
-                let hour = date.hour();
-                let day_of_week = date.weekday().num_days_from_sunday();
-                let day = date.day();
-                let month = date.month();
-                let year = date.year();
-
-                let matches = time.second.matches_value(second)
-                    && time.minute.matches_value(minute)
-                    && time.hour.matches_value(hour)
-                    && time.day_of_week.matches_value(day_of_week)
-                    && time.day.matches_value(day)
-                    && time.month.matches_value(month)
-                    && time.year.matches_value(year as u32);
-
-                if matches {
-                    debug!("Task '{}' matches schedule at {}", task.config.name, date);
-                } else {
-                    debug!("Task '{}' does NOT match schedule at {}", task.config.name, date);
-                }
-
-                matches
+        // If the last execution was at this time, avoid running it again, wait until at least the next second
+        if let Some(time) = task.last_execution_time {
+            if time.timestamp() == now.timestamp() {
+                return false;
             }
         }
+
+        let next_scheduled_run = Self::get_next_execution_time(task, now);
+        // If the next scheduled run is now, return true
+        next_scheduled_run.timestamp() <= now.timestamp()
     }
 
     /// Checks if the task is running
@@ -369,7 +345,12 @@ impl Scheduler {
     }
 
     /// Spawns a subprocess to execute the task
-    async fn execute_task(task: &PendingTask, alerts: &AlertConfig, config: &Config, sqlite_logger: &Option<SqliteLogger>) -> anyhow::Result<ActiveTask> {
+    async fn execute_task(
+        task: &PendingTask,
+        alerts: &AlertConfig,
+        config: &Config,
+        sqlite_logger: &Option<SqliteLogger>,
+    ) -> anyhow::Result<ActiveTask> {
         let stdout_path = if let Some(path) = task.config.stdout.as_deref() {
             PathBuf::from(path)
         } else {
@@ -528,7 +509,7 @@ impl Scheduler {
                         run_as: task.config.run_as.clone(),
                         time_limit: task.config.time_limit,
                     };
-                    
+
                     if let Err(e) = sqlite_logger.log_execution_attempt(&attempt).await {
                         error!("Failed to log execution attempt for task '{}': {}", task.config.name, e);
                     }
@@ -582,7 +563,12 @@ impl Scheduler {
     }
 
     /// Handle the task completion
-    async fn on_task_completed(task: &ActiveTask, status: ExitStatus, config: &Config, sqlite_logger: &Option<SqliteLogger>) {
+    async fn on_task_completed(
+        task: &ActiveTask,
+        status: ExitStatus,
+        config: &Config,
+        sqlite_logger: &Option<SqliteLogger>,
+    ) {
         let exit_code = status.code().unwrap_or(-1);
         let execution_time = task.start_instant.elapsed();
 
@@ -619,7 +605,12 @@ impl Scheduler {
     }
 
     /// Notify the user about task failure
-    async fn on_task_failure(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_failure: &[Alert], sqlite_logger: &Option<SqliteLogger>) {
+    async fn on_task_failure(
+        details: &TaskExecutionDetails,
+        alerts: &AlertConfig,
+        task_on_failure: &[Alert],
+        sqlite_logger: &Option<SqliteLogger>,
+    ) {
         for alert in &alerts.on_failure {
             if let Err(e) = send_alert(alert, details) {
                 error!("Failed to send alert for task '{}': {}", details.task_name, e);
@@ -627,7 +618,10 @@ impl Scheduler {
         }
         for alert in task_on_failure {
             if let Err(e) = send_alert(alert, details) {
-                error!("Failed to send task-specific alert for task '{}': {}", details.task_name, e);
+                error!(
+                    "Failed to send task-specific alert for task '{}': {}",
+                    details.task_name, e
+                );
             }
         }
 
@@ -639,19 +633,31 @@ impl Scheduler {
                 start_time: details.start_time,
                 end_time: details.start_time + chrono::Duration::from_std(details.duration).unwrap_or_default(),
                 duration_seconds: details.duration.as_secs_f64(),
-                exit_code: if details.exit_code == -1 { None } else { Some(details.exit_code) },
+                exit_code: if details.exit_code == -1 {
+                    None
+                } else {
+                    Some(details.exit_code)
+                },
                 error_message: details.error_message.clone(),
                 failure_reason: "Task execution failed".to_string(),
             };
-            
+
             if let Err(e) = sqlite_logger.log_execution_failure(&failure).await {
-                error!("Failed to log execution failure for task '{}': {}", details.task_name, e);
+                error!(
+                    "Failed to log execution failure for task '{}': {}",
+                    details.task_name, e
+                );
             }
         }
     }
 
     /// Notify the user about task success
-    async fn on_task_success(details: &TaskExecutionDetails, alerts: &AlertConfig, task_on_success: &[Alert], sqlite_logger: &Option<SqliteLogger>) {
+    async fn on_task_success(
+        details: &TaskExecutionDetails,
+        alerts: &AlertConfig,
+        task_on_success: &[Alert],
+        sqlite_logger: &Option<SqliteLogger>,
+    ) {
         for alert in &alerts.on_success {
             if let Err(e) = send_alert(alert, details) {
                 error!("Failed to send alert for task '{}': {}", details.task_name, e);
@@ -659,7 +665,10 @@ impl Scheduler {
         }
         for alert in task_on_success {
             if let Err(e) = send_alert(alert, details) {
-                error!("Failed to send task-specific alert for task '{}': {}", details.task_name, e);
+                error!(
+                    "Failed to send task-specific alert for task '{}': {}",
+                    details.task_name, e
+                );
             }
         }
 
@@ -673,44 +682,61 @@ impl Scheduler {
                 duration_seconds: details.duration.as_secs_f64(),
                 exit_code: details.exit_code,
             };
-            
+
             if let Err(e) = sqlite_logger.log_execution_success(&success).await {
-                error!("Failed to log execution success for task '{}': {}", details.task_name, e);
+                error!(
+                    "Failed to log execution success for task '{}': {}",
+                    details.task_name, e
+                );
             }
         }
     }
 
     /// Calculate the next date and time for the task to run
-    fn get_next_execution_time(task: &PendingTask, current_date: DateTime<Tz>) -> DateTime<Tz> {
+    /// current_date: must be rounded to the second, use Self::get_current_datetime_at(timezone) to get it
+    pub fn get_next_execution_time(task: &PendingTask, current_date: DateTime<Tz>) -> DateTime<Tz> {
         match &task.config.schedule {
-            Schedule::Every { interval } => {
-                // Add 1 second to avoid returning the same value
-                let current_date1 = current_date.add(TimeDelta::seconds(1));
+            Schedule::Every { interval, aligned } => {
+                let tmp = if let (Some(last_execution), Some(last_execution_time)) =
+                    (task.last_execution, task.last_execution_time)
+                {
+                    // Bad input, assume no previous run
+                    if current_date.timestamp() < last_execution_time.timestamp() {
+                        return current_date;
+                    }
 
-                if let Some(last_execution) = task.last_execution {
-                    let next_run = last_execution + *interval;
-                    let now = Instant::now();
-                    if next_run <= now {
-                        current_date1
+                    let last_execution_in_tz = last_execution_time
+                        .with_timezone(&task.config.timezone)
+                        .with_nanosecond(0)
+                        .unwrap();
+
+                    if *aligned {
+                        // Make the next run aligned to the interval length
+                        let tick_len = interval.as_secs() as i64;
+                        let current_date_after_interval = ((current_date.timestamp() + tick_len) / tick_len) * tick_len;
+                        let diff = current_date_after_interval - current_date.timestamp();
+
+                        last_execution_in_tz + chrono::Duration::seconds(diff)
                     } else {
-                        current_date + chrono::Duration::from_std(next_run - now).unwrap()
+                        last_execution_in_tz + chrono::Duration::from_std(*interval).unwrap()
                     }
                 } else {
                     // First run
-                    current_date1.with_nanosecond(0).unwrap_or(current_date1)
-                }
+                    current_date
+                };
+
+                tmp
             }
             Schedule::When { time } => {
                 // Add 1 second to avoid returning the same value
-                let current_date1 = current_date.add(TimeDelta::seconds(1));
-                let mut curr = current_date1;
+                let mut curr = current_date;
                 let mut limit = 365;
 
                 loop {
                     // Iteration limit to avoid infinite loops
                     if limit <= 0 {
                         error!("Task '{}' has no valid next execution time", task.config.name);
-                        return current_date1;
+                        return current_date;
                     }
                     limit -= 1;
 
@@ -738,7 +764,7 @@ impl Scheduler {
                         continue;
                     }
 
-                    return next_date;
+                    return next_date.with_nanosecond(0).unwrap_or(next_date);
                 }
             }
         }
@@ -794,5 +820,17 @@ impl Scheduler {
         start_of_next_month
             .signed_duration_since(start_of_this_month)
             .num_days() as u32
+    }
+}
+
+impl PendingTask {
+    pub fn new(config: TaskConfig) -> Self {
+        PendingTask {
+            config,
+            last_execution: None,
+            last_execution_time: None,
+            last_pid: None,
+            retries: 0,
+        }
     }
 }
