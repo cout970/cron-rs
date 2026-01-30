@@ -4,3 +4,4 @@
 stdout.log
 stderr.log
 crontab_config.yml
+cron-rs_scheduler_state.json

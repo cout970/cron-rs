@@ -26,6 +26,7 @@ use self::timeunit::TimeUnit;
 use log::warn;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use std::time::Duration;
 use crate::alerts::{Alert, AlertConfig};
 use crate::sqlite_logger::SqliteLoggerConfig;
@@ -50,7 +51,7 @@ pub struct TaskConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    pub tasks: Vec<TaskConfig>,
+    pub tasks: Vec<Arc<TaskConfig>>,
     pub logging: LoggingConfig,
     pub alerts: AlertConfig,
 }
@@ -84,7 +85,7 @@ pub enum TimePatternField {
 }
 
 pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
-    let mut tasks: Vec<TaskConfig> = Vec::with_capacity(file.tasks.len());
+    let mut tasks: Vec<Arc<TaskConfig>> = Vec::with_capacity(file.tasks.len());
 
     for (i, config) in file.tasks.iter().enumerate() {
         let task = TaskConfig::parse(config).context(format!(
@@ -92,7 +93,7 @@ pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
             &config.name,
             i + 1
         ))?;
-        tasks.push(task);
+        tasks.push(Arc::new(task));
     }
 
     let logging_config = file.logging.clone().unwrap_or_default();
@@ -246,31 +247,32 @@ impl TimePatternField {
         }
     }
     
-    /// Returns a tuple with the next valid value and 1 if the value requires wrapping, 0 if it doesn't
+    /// Returns a tuple with the next valid value and 1 if the value requires increasing the next number, 0 if it doesn't
     pub fn get_next_valid_value(&self, the_value: u32, limit: u32) -> (u32, u32) {
         let value = the_value % limit;
+        let overflows: u32 = if the_value >= limit { 1 } else { 0 };
         match self {
-            TimePatternField::Any => (value, 0),
+            TimePatternField::Any => (value, overflows),
             TimePatternField::Value(v) => {
                 if value <= *v {
-                    (*v, 0)
+                    (*v, overflows)
                 } else {
                     (*v, 1)
                 }
             }
             TimePatternField::Range(start, end) => {
                 if value < *start {
-                    (*start, 0)
+                    (*start, overflows)
                 } else if value > *end {
                     (*start, 1)
                 } else {
-                    (value, 0)
+                    (value, overflows)
                 }
             }
             TimePatternField::List(values) => {
                 if let Some(next_value) = values.iter().find(|&&v| v >= value) {
                     if value <= *next_value {
-                        (*next_value, 0)
+                        (*next_value, overflows)
                     } else {
                         (*next_value, 1)
                     }
@@ -281,7 +283,7 @@ impl TimePatternField {
             }
             TimePatternField::Ratio(divisor, offset) => {
                 let mut curr = value;
-                let mut rest = 0u32;
+                let mut rest = overflows;
 
                 // Do a full cycle to find the next valid value
                 for i in 0..limit {

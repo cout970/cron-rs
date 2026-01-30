@@ -7,9 +7,11 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Timelike};
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
 use log::{debug, error, info, warn};
+use serde_json::json;
 use signal_hook::consts::SIGINT;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io;
 use std::ops::{Add, Deref};
 use std::os::unix::prelude::CommandExt;
 use std::path::PathBuf;
@@ -21,14 +23,14 @@ use sysinfo::{Gid, Groups, ProcessStatus, User, Users};
 use sysinfo::{Pid, System};
 use tokio::process::{Child, Command};
 use tokio::signal;
+use tokio::signal::unix::SignalKind;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
 pub struct PendingTask {
-    pub config: TaskConfig,
-    pub last_execution: Option<Instant>,
+    pub config: Arc<TaskConfig>,
     pub last_execution_time: Option<DateTime<Utc>>,
     pub last_pid: Option<u32>,
     pub retries: u32,
@@ -36,24 +38,24 @@ pub struct PendingTask {
 
 static ACTIVE_TASK_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ActiveTask {
     id: u32,
-    config: TaskConfig,
+    config: Arc<TaskConfig>,
     pid: u32,
     start_instant: Instant,
     start_time: DateTime<Utc>,
     child: Arc<Mutex<Child>>,
     debug_info: String,
     time_limit: Option<u64>,
-    stdout: PathBuf,
-    stderr: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
 }
 
 pub struct Scheduler {
-    tasks: Vec<TaskConfig>,
+    tasks: Vec<Arc<TaskConfig>>,
     active_tasks: Vec<ActiveTask>,
-    running_tasks: Vec<PendingTask>,
+    pending_tasks: Vec<Arc<Mutex<PendingTask>>>,
     async_handles: Vec<JoinHandle<()>>,
     config: Config,
     sqlite_logger: Option<SqliteLogger>,
@@ -64,7 +66,7 @@ impl Scheduler {
         Scheduler {
             tasks: config.tasks.clone(),
             active_tasks: Vec::new(),
-            running_tasks: Vec::new(),
+            pending_tasks: Vec::new(),
             async_handles: Vec::new(),
             config,
             sqlite_logger: None,
@@ -77,6 +79,58 @@ impl Scheduler {
 
         runtime.block_on(Self::run_async(mutex))?;
         Ok(())
+    }
+
+    pub async fn save_state(&self) {
+        let mut pending_tasks = vec![];
+
+        for t in &self.pending_tasks {
+            let pt = t.lock().await;
+            let now: DateTime<Tz> = Self::get_current_datetime_at(pt.config.timezone);
+
+            // Use the current datetime plus 1 second to avoid returning the exact same value
+            let next_run = Self::get_next_execution_time(&pt, now, false);
+
+            pending_tasks.push(json!({
+                "config_name": pt.config.name,
+                "last_execution_time": pt.last_execution_time.map(|dt| dt.to_rfc3339()),
+                "last_pid": pt.last_pid,
+                "retries": pt.retries,
+                "next_run": next_run.to_rfc3339(),
+            }));
+        }
+
+        let active_tasks = self
+            .active_tasks
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "config_name": t.config.name,
+                    "pid": t.pid,
+                    "start_time": t.start_time.to_rfc3339(),
+                    "time_limit": t.time_limit,
+                    "stdout_path": t.stdout_path.to_string_lossy(),
+                    "stderr_path": t.stderr_path.to_string_lossy(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = serde_json::to_string(&json!({
+            "now": Utc::now().to_rfc3339(),
+            "pending_tasks": pending_tasks,
+            "active_tasks": active_tasks,
+        }))
+        .unwrap();
+
+        state.push_str("\n");
+
+        // TODO make the path configurable
+        let res = tokio::fs::write("./cron-rs_scheduler_state.json", state.as_bytes()).await;
+
+        if let Err(e) = res {
+            error!("Failed to save scheduler state: {}", e);
+        }
     }
 
     async fn run_async(mutex: Arc<Mutex<Scheduler>>) -> anyhow::Result<()> {
@@ -97,92 +151,26 @@ impl Scheduler {
             }
         }
 
-        let tasks_config = {
-            let scheduler = mutex.lock().await;
-            scheduler.tasks.clone()
+        let pending_tasks: Vec<Arc<Mutex<PendingTask>>> = {
+            let mut scheduler = mutex.lock().await;
+            let mut pending_tasks = vec![];
+
+            for t in &scheduler.tasks {
+                let pt = PendingTask::new(t.clone());
+                pending_tasks.push(Arc::new(Mutex::new(pt)));
+            }
+
+            scheduler.pending_tasks = pending_tasks.clone();
+            pending_tasks
         };
-        info!("Initializing scheduler with {} tasks", tasks_config.len());
+        info!("Initializing scheduler with {} tasks", pending_tasks.len());
 
         // Spawn task execution tasks
-        for task in &tasks_config {
-            let task_config = task.clone();
+        for pending_task_mutex in pending_tasks {
             let scheduler_mutex = mutex.clone();
 
             let handle = tokio::spawn(async move {
-                let mut pending_task = PendingTask::new(task_config);
-
-                // Wait loop for the right time to execute the task
-                loop {
-                    let start = Instant::now();
-                    // Check if the task must be executed now
-                    if !Self::is_task_ready_for_execution(&pending_task) {
-                        Self::sleep_until_task_is_ready(&pending_task).await;
-                        continue;
-                    }
-
-                    // Verify that the previous execution is finished, if the config requires it
-                    if pending_task.config.avoid_overlapping {
-                        let running_tasks = {
-                            let scheduler = scheduler_mutex.lock().await;
-                            scheduler.running_tasks.clone()
-                        };
-
-                        if Self::is_task_running(&pending_task, &running_tasks) {
-                            debug!(
-                                "Task '{}' is already running, skipping execution",
-                                pending_task.config.name
-                            );
-                            Self::sleep_until_task_is_ready(&pending_task).await;
-                            continue;
-                        }
-                    }
-
-                    // Execute the task
-                    let (alert_config, config, sqlite_logger) = {
-                        let scheduler = scheduler_mutex.lock().await;
-                        (
-                            scheduler.config.alerts.clone(),
-                            scheduler.config.clone(),
-                            scheduler.sqlite_logger.clone(),
-                        )
-                    };
-                    let active_task =
-                        match Self::execute_task(&pending_task, &alert_config, &config, &sqlite_logger).await {
-                            Ok(active_task) => active_task,
-                            Err(e) => {
-                                error!("{}", e);
-                                continue;
-                            }
-                        };
-
-                    pending_task.last_execution = Some(active_task.start_instant);
-                    pending_task.last_execution_time = Some(active_task.start_time);
-                    pending_task.last_pid = Some(active_task.pid);
-
-                    let task_id = active_task.id;
-                    {
-                        let mut scheduler = scheduler_mutex.lock().await;
-                        scheduler.running_tasks.push(pending_task.clone());
-                        scheduler.active_tasks.push(active_task);
-                    }
-
-                    // Wait for the task to finish
-                    Self::wait_for_task(scheduler_mutex.clone(), task_id).await;
-
-                    // Sleep at least to the next second to avoid running the task multiple times the same datetime
-                    if start.elapsed().as_secs() < 1 {
-                        // Sleeping a hole second makes the time drifts slowly, by sleeping only the
-                        // millis needed to jump to the next second, we mostly eliminate the drift
-                        let next_second =
-                            Self::get_current_datetime_at(pending_task.config.timezone) + TimeDelta::seconds(1);
-                        let current_second = Self::get_precise_datetime_at(pending_task.config.timezone);
-
-                        // Get the number of milliseconds to the next second
-                        let diff = next_second.signed_duration_since(current_second).num_milliseconds() as u64;
-
-                        sleep(Duration::from_millis(diff)).await;
-                    }
-                }
+                Self::execute_task_loop(pending_task_mutex, scheduler_mutex).await;
             });
 
             {
@@ -193,20 +181,118 @@ impl Scheduler {
 
         // Wait for Ctrl+C signal to stop the infinite loop
         let ctrl_c = signal::ctrl_c();
+        let mut sigusr1 = signal::unix::signal(SignalKind::user_defined1()).expect("Failed to register SIGUSR1");
+
         tokio::pin!(ctrl_c);
-        tokio::select! {
-            _ = &mut ctrl_c => {
-                info!("Scheduler shutdown initiated");
-                {
-                    let mut scheduler = mutex.lock().await;
-                    for handle in &scheduler.async_handles {
-                        handle.abort();
+        tokio::pin!(sigusr1);
+        loop {
+            tokio::select! {
+                _ = &mut ctrl_c => {
+                    info!("Scheduler shutdown initiated");
+                    {
+                        let mut scheduler = mutex.lock().await;
+                        scheduler.save_state().await;
+
+                        for handle in &scheduler.async_handles {
+                            handle.abort();
+                        }
+                    }
+                    break;
+                }
+                _ = sigusr1.recv() => {
+                    info!("Received SIGUSR1, saving scheduler state");
+                    {
+                        let mut scheduler = mutex.lock().await;
+                        scheduler.save_state().await;
                     }
                 }
             }
         }
 
         Ok(())
+    }
+
+    async fn execute_task_loop(pending_task_mutex: Arc<Mutex<PendingTask>>, scheduler_mutex: Arc<Mutex<Scheduler>>) {
+        // Wait loop for the right time to execute the task
+        loop {
+            let pending_task_copy: PendingTask = { pending_task_mutex.lock().await.clone() };
+
+            let start = Instant::now();
+            // Check if the task must be executed now
+            if !Self::is_task_ready_for_execution(&pending_task_copy) {
+                Self::sleep_until_task_is_ready(&pending_task_copy).await;
+                continue;
+            }
+
+            // Verify that the previous execution is finished, if the config requires it
+            if pending_task_copy.config.avoid_overlapping {
+                let running_tasks = {
+                    let scheduler = scheduler_mutex.lock().await;
+                    scheduler
+                        .active_tasks
+                        .iter()
+                        .map(|t| t.config.name.to_string())
+                        .collect::<Vec<_>>()
+                };
+
+                if Self::is_task_running(&pending_task_copy, &running_tasks) {
+                    debug!(
+                        "Task '{}' is already running, skipping execution",
+                        pending_task_copy.config.name
+                    );
+                    Self::sleep_until_task_is_ready(&pending_task_copy).await;
+                    continue;
+                }
+            }
+
+            // Execute the task
+            let (alert_config, config, sqlite_logger) = {
+                let scheduler = scheduler_mutex.lock().await;
+                (
+                    scheduler.config.alerts.clone(),
+                    scheduler.config.clone(),
+                    scheduler.sqlite_logger.clone(),
+                )
+            };
+            let active_task =
+                match Self::execute_task(&pending_task_copy.config, &alert_config, &config, &sqlite_logger).await {
+                    Ok(active_task) => active_task,
+                    Err(e) => {
+                        error!("{}", e);
+                        continue;
+                    }
+                };
+
+            {
+                let mut pending_task = pending_task_mutex.lock().await;
+                pending_task.last_execution_time = Some(active_task.start_time);
+                pending_task.last_pid = Some(active_task.pid);
+            }
+
+            let task_id = active_task.id;
+            {
+                let mut scheduler = scheduler_mutex.lock().await;
+                scheduler.active_tasks.push(active_task);
+                scheduler.save_state().await;
+            }
+
+            // Wait for the task to finish
+            Self::wait_for_task(scheduler_mutex.clone(), task_id).await;
+
+            // Sleep at least to the next second to avoid running the task multiple times the same datetime
+            if start.elapsed().as_secs() < 1 {
+                // Sleeping a whole second makes the time drifts slowly, by sleeping only the
+                // millis needed to jump to the next second, we mostly eliminate the drift
+                let next_second =
+                    Self::get_current_datetime_at(pending_task_copy.config.timezone) + TimeDelta::seconds(1);
+                let current_second = Self::get_precise_datetime_at(pending_task_copy.config.timezone);
+
+                // Get the number of milliseconds to the next second
+                let diff = next_second.signed_duration_since(current_second).num_milliseconds() as u64;
+
+                sleep(Duration::from_millis(diff)).await;
+            }
+        }
     }
 
     // Wait for the task to end and handle the result
@@ -250,9 +336,6 @@ impl Scheduler {
 
             {
                 let mut scheduler = scheduler_mutex.lock().await;
-                // Remove running task
-                scheduler.running_tasks.retain(|t| t.config.name != task_name);
-
                 // Remove active task
                 let active_task_index = scheduler
                     .active_tasks
@@ -292,7 +375,7 @@ impl Scheduler {
         let now: DateTime<Tz> = Self::get_current_datetime_at(task.config.timezone);
 
         // Use the current datetime plus 1 second to avoid returning the exact same value
-        let next_run = Self::get_next_execution_time(&task, now);
+        let next_run = Self::get_next_execution_time(&task, now, true);
         let wait_time = next_run.signed_duration_since(precise_now);
 
         debug!(
@@ -327,13 +410,13 @@ impl Scheduler {
             }
         }
 
-        let next_scheduled_run = Self::get_next_execution_time(task, now);
+        let next_scheduled_run = Self::get_next_execution_time(task, now, true);
         // If the next scheduled run is now, return true
         next_scheduled_run.timestamp() <= now.timestamp()
     }
 
     /// Checks if the task is running
-    fn is_task_running(task: &PendingTask, active_tasks: &[PendingTask]) -> bool {
+    fn is_task_running<T: AsRef<str>>(task: &PendingTask, active_tasks: &[T]) -> bool {
         if let Some(pid) = task.last_pid {
             let sys = System::new_all();
             if sys.process(Pid::from_u32(pid)).is_some() {
@@ -341,31 +424,31 @@ impl Scheduler {
             }
         }
 
-        active_tasks.iter().any(|active| active.config.name == task.config.name)
+        active_tasks.iter().any(|name| name.as_ref() == task.config.name)
     }
 
     /// Spawns a subprocess to execute the task
     async fn execute_task(
-        task: &PendingTask,
+        task_config: &Arc<TaskConfig>,
         alerts: &AlertConfig,
         config: &Config,
         sqlite_logger: &Option<SqliteLogger>,
     ) -> anyhow::Result<ActiveTask> {
-        let stdout_path = if let Some(path) = task.config.stdout.as_deref() {
+        let stdout_path = if let Some(path) = task_config.stdout.as_deref() {
             PathBuf::from(path)
         } else {
             PathBuf::from(format!(
                 ".tmp/{}_stdout.log",
-                sanitise_file_name::sanitise(&task.config.name)
+                sanitise_file_name::sanitise(&task_config.name)
             ))
         };
 
-        let stderr_path = if let Some(path) = task.config.stderr.as_deref() {
+        let stderr_path = if let Some(path) = task_config.stderr.as_deref() {
             PathBuf::from(path)
         } else {
             PathBuf::from(format!(
                 ".tmp/{}_stderr.log",
-                sanitise_file_name::sanitise(&task.config.name)
+                sanitise_file_name::sanitise(&task_config.name)
             ))
         };
 
@@ -374,7 +457,7 @@ impl Scheduler {
                 tokio::fs::create_dir_all(path).await.expect(
                     format!(
                         "Failed to create stdout parent directory for task '{}'",
-                        task.config.name
+                        task_config.name
                     )
                     .as_str(),
                 );
@@ -385,7 +468,7 @@ impl Scheduler {
                 tokio::fs::create_dir_all(path).await.expect(
                     format!(
                         "Failed to create stderr parent directory for task '{}'",
-                        task.config.name
+                        task_config.name
                     )
                     .as_str(),
                 );
@@ -398,7 +481,7 @@ impl Scheduler {
                 return Err(anyhow!(
                     "Failed to create {} for task '{}': {}",
                     stdout_path.to_string_lossy(),
-                    task.config.name,
+                    task_config.name,
                     e
                 ));
             }
@@ -409,7 +492,7 @@ impl Scheduler {
                 return Err(anyhow!(
                     "Failed to create {} for task '{}': {}",
                     stderr_path.to_string_lossy(),
-                    task.config.name,
+                    task_config.name,
                     e
                 ));
             }
@@ -419,15 +502,15 @@ impl Scheduler {
         let mut debug_info = String::new();
 
         // Shell to run the command
-        let shell = task.config.shell.as_deref().unwrap_or_else(|| "/bin/sh");
+        let shell = task_config.shell.as_deref().unwrap_or_else(|| "/bin/sh");
 
-        debug_info.push_str(&format!("Cmd: {} -c '{}'\n", shell, task.config.cmd));
+        debug_info.push_str(&format!("Cmd: {} -c '{}'\n", shell, task_config.cmd));
         let mut cmd = Command::new(shell);
         cmd.arg("-c");
-        cmd.arg(&task.config.cmd);
+        cmd.arg(&task_config.cmd);
 
         // Set environment variables if specified
-        if let Some(env) = &task.config.env {
+        if let Some(env) = &task_config.env {
             for (key, value) in env {
                 debug_info.push_str(&format!("Env '{}' => '{}'\n", key, value));
                 cmd.env(key, value);
@@ -435,15 +518,15 @@ impl Scheduler {
             debug!(
                 "Set {} environment variables for task '{}'",
                 env.len(),
-                task.config.name
+                task_config.name
             );
         }
 
         // Set working directory if specified
-        if let Some(dir) = &task.config.working_directory {
+        if let Some(dir) = &task_config.working_directory {
             debug_info.push_str(&format!("Working dir '{}'\n", dir));
             cmd.current_dir(dir);
-            debug!("Set runtime directory to '{}' for task '{}'", dir, task.config.name);
+            debug!("Set runtime directory to '{}' for task '{}'", dir, task_config.name);
         }
 
         // Set output redirection
@@ -453,7 +536,7 @@ impl Scheduler {
         cmd.stderr(Stdio::from(stderr));
 
         // Run as another user if specified
-        if let Some(run_as) = &task.config.run_as {
+        if let Some(run_as) = &task_config.run_as {
             // Only available on Unix-like systems
             if cfg!(unix) {
                 let (uid, user_str, gid, group_str) = match Self::get_uid_and_gid(run_as) {
@@ -461,7 +544,7 @@ impl Scheduler {
                     Err(e) => {
                         return Err(anyhow!(
                             "Failed to get uid and gid for task '{}': {}",
-                            task.config.name,
+                            task_config.name,
                             e
                         ));
                     }
@@ -476,12 +559,12 @@ impl Scheduler {
                 }
                 debug!(
                     "Task '{}' will run as user '{}' and group '{}'",
-                    task.config.name, user_str, group_str
+                    task_config.name, user_str, group_str
                 );
             } else {
                 warn!(
                     "Task '{}' cannot run as '{}', unsupported on this platform",
-                    task.config.name, run_as
+                    task_config.name, run_as
                 );
             }
         }
@@ -493,68 +576,68 @@ impl Scheduler {
             Ok(child) => {
                 let pid = child.id().unwrap_or(0);
                 let task_id = ACTIVE_TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
-                info!("Task '{}' started with PID: {}", task.config.name, pid);
+                info!("Task '{}' started with PID: {}", task_config.name, pid);
 
                 // Log execution attempt to SQLite
                 if let Some(sqlite_logger) = sqlite_logger {
                     let attempt = ExecutionAttempt {
-                        task_name: task.config.name.clone(),
+                        task_name: task_config.name.clone(),
                         task_id,
                         pid,
-                        cmd: task.config.cmd.clone(),
+                        cmd: task_config.cmd.clone(),
                         start_time: clock_time,
-                        timezone: task.config.timezone.to_string(),
-                        working_directory: task.config.working_directory.clone(),
-                        shell: task.config.shell.clone(),
-                        run_as: task.config.run_as.clone(),
-                        time_limit: task.config.time_limit,
+                        timezone: task_config.timezone.to_string(),
+                        working_directory: task_config.working_directory.clone(),
+                        shell: task_config.shell.clone(),
+                        run_as: task_config.run_as.clone(),
+                        time_limit: task_config.time_limit,
                     };
 
                     if let Err(e) = sqlite_logger.log_execution_attempt(&attempt).await {
-                        error!("Failed to log execution attempt for task '{}': {}", task.config.name, e);
+                        error!("Failed to log execution attempt for task '{}': {}", task_config.name, e);
                     }
                 }
 
                 Ok(ActiveTask {
                     id: task_id,
-                    config: task.config.clone(),
+                    config: task_config.clone(),
                     pid,
                     start_instant: now,
                     start_time: clock_time,
                     child: Arc::new(Mutex::new(child)),
                     debug_info: debug_info.trim().to_string(),
-                    time_limit: task.config.time_limit,
-                    stdout: stdout_path.clone(),
-                    stderr: stderr_path.clone(),
+                    time_limit: task_config.time_limit,
+                    stdout_path: stdout_path.clone(),
+                    stderr_path: stderr_path.clone(),
                 })
             }
             Err(e) => {
-                if e.to_string().contains("Operation not permitted") && task.config.run_as.is_some() {
+                if e.to_string().contains("Operation not permitted") && task_config.run_as.is_some() {
                     debug_info.push_str(&format!(
                         "Note: The task was executed with run_as '{}', make sure the current user '{}' has permission to run as that user",
-                        task.config.run_as.as_deref().unwrap(),
+                        task_config.run_as.as_deref().unwrap(),
                         users::get_current_username().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "<unknown>".to_string())
                     ));
                 }
 
                 let details = TaskExecutionDetails {
-                    task_name: task.config.name.to_string(),
+                    task_name: task_config.name.to_string(),
                     task_id: 0,
                     pid: 0,
                     exit_code: -1,
                     start_time: clock_time,
                     duration: Duration::default(),
-                    error_message: format!("Task '{}' failed to start", task.config.name),
+                    error_message: format!("Task '{}' failed to start", task_config.name),
                     debug_info: debug_info.trim().to_string(),
                     stdout: String::new(),
                     stderr: e.to_string(),
                 };
 
-                Self::on_task_failure(&details, alerts, &task.config.on_failure, sqlite_logger).await;
+                Self::on_task_failure(&details, alerts, &task_config.on_failure, sqlite_logger).await;
 
                 Err(anyhow!(
                     "Task '{}' failed to start: {}, Debug info:\n{}",
-                    task.config.name,
+                    task_config.name,
                     e,
                     debug_info
                 ))
@@ -581,8 +664,8 @@ impl Scheduler {
             duration: execution_time,
             error_message: format!("Task '{}' failed, {}", task.config.name, status),
             debug_info: task.debug_info.clone(),
-            stdout: tokio::fs::read_to_string(&task.stdout).await.unwrap_or_default(),
-            stderr: tokio::fs::read_to_string(&task.stderr).await.unwrap_or_default(),
+            stdout: tokio::fs::read_to_string(&task.stdout_path).await.unwrap_or_default(),
+            stderr: tokio::fs::read_to_string(&task.stderr_path).await.unwrap_or_default(),
         };
 
         if !status.success() {
@@ -694,12 +777,10 @@ impl Scheduler {
 
     /// Calculate the next date and time for the task to run
     /// current_date: must be rounded to the second, use Self::get_current_datetime_at(timezone) to get it
-    pub fn get_next_execution_time(task: &PendingTask, current_date: DateTime<Tz>) -> DateTime<Tz> {
+    pub fn get_next_execution_time(task: &PendingTask, current_date: DateTime<Tz>, allow_now: bool) -> DateTime<Tz> {
         match &task.config.schedule {
             Schedule::Every { interval, aligned } => {
-                let tmp = if let (Some(last_execution), Some(last_execution_time)) =
-                    (task.last_execution, task.last_execution_time)
-                {
+                let next_date = if let Some(last_execution_time) = task.last_execution_time {
                     // Bad input, assume no previous run
                     if current_date.timestamp() < last_execution_time.timestamp() {
                         return current_date;
@@ -725,10 +806,20 @@ impl Scheduler {
                     current_date
                 };
 
-                tmp
+                if next_date < current_date {
+                    panic!(
+                        "[every] Logic error in next date calculation: curr = {}, next = {}, next < curr",
+                        current_date, next_date
+                    );
+                }
+
+                if allow_now && next_date == current_date {
+                    next_date.add(chrono::Duration::from_std(*interval).unwrap())
+                } else {
+                    next_date
+                }
             }
             Schedule::When { time } => {
-                // Add 1 second to avoid returning the same value
                 let mut curr = current_date;
                 let mut limit = 365;
 
@@ -736,27 +827,49 @@ impl Scheduler {
                     // Iteration limit to avoid infinite loops
                     if limit <= 0 {
                         error!("Task '{}' has no valid next execution time", task.config.name);
-                        return current_date;
+                        return if allow_now {
+                            current_date
+                        } else {
+                            current_date.add(TimeDelta::seconds(1))
+                        };
                     }
                     limit -= 1;
 
-                    // Try next second, minute, hour, etc.
-                    let (second, t) = time.second.get_next_valid_value(curr.second(), 60);
-                    let (minute, t) = time.minute.get_next_valid_value(curr.minute() + t, 60);
-                    let (hour, t) = time.hour.get_next_valid_value(curr.hour() + t, 24);
-                    let mut days_in_month = Self::get_num_of_days_in_month(curr.month(), curr.year());
-                    if curr.day() + t >= days_in_month {
-                        days_in_month = Self::get_num_of_days_in_month(curr.month() + 1, curr.year());
-                    }
-                    let (day0, t) = time.day.get_next_valid_value(curr.day0() + t, days_in_month);
-                    let (month0, t) = time.month.get_next_valid_value(curr.month0() + t, 12);
-                    let (year, _) = time.year.get_next_valid_value(curr.year() as u32, 3000);
+                    let curr_second = curr.second();
+                    let curr_minute = curr.minute();
+                    let curr_hour = curr.hour();
+                    let curr_day0 = curr.day0();
+                    let curr_month = curr.month();
+                    let curr_month0 = curr.month0();
+                    let curr_year = curr.year();
 
-                    let mut next_date = task
-                        .config
-                        .timezone
+                    // Try next second, minute, hour, etc.
+                    let (second, t) = time.second.get_next_valid_value(curr_second, 60);
+                    let (minute, t) = time.minute.get_next_valid_value(curr_minute + t, 60);
+                    let (hour, t) = time.hour.get_next_valid_value(curr_hour + t, 24);
+                    let days_in_month = Self::get_num_of_days_in_month(curr_month, curr_year);
+                    let (day0, t) = time.day.get_next_valid_value(curr_day0 + t, days_in_month);
+                    let (month0, t) = time.month.get_next_valid_value(curr_month0 + t, 12);
+                    let (year, _) = time.year.get_next_valid_value(curr_year as u32, 3000);
+
+                    let mut next_date = current_date
+                        .timezone()
                         .with_ymd_and_hms(year as i32, month0 + 1, day0 + 1, hour, minute, second)
                         .unwrap();
+
+                    next_date = next_date.with_nanosecond(0).unwrap_or(next_date);
+
+                    if next_date < curr {
+                        panic!(
+                            "[when] Logic error in next date calculation: curr = {}, next = {}, next < curr",
+                            curr, next_date
+                        );
+                    }
+
+                    if !allow_now && next_date == curr {
+                        curr = next_date.add(TimeDelta::seconds(1));
+                        continue;
+                    }
 
                     // If the day of the week doesn't match, move to the next day
                     if !time.day_of_week.matches_value(curr.weekday().num_days_from_monday()) {
@@ -764,7 +877,7 @@ impl Scheduler {
                         continue;
                     }
 
-                    return next_date.with_nanosecond(0).unwrap_or(next_date);
+                    return next_date;
                 }
             }
         }
@@ -824,10 +937,9 @@ impl Scheduler {
 }
 
 impl PendingTask {
-    pub fn new(config: TaskConfig) -> Self {
+    pub fn new(config: Arc<TaskConfig>) -> Self {
         PendingTask {
             config,
-            last_execution: None,
             last_execution_time: None,
             last_pid: None,
             retries: 0,

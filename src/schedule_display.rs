@@ -3,6 +3,7 @@ use crate::scheduler::{PendingTask, Scheduler};
 use chrono::{DateTime, Datelike, Duration, TimeDelta, TimeZone, Timelike};
 use chrono_tz::Tz;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub struct ScheduleDisplay;
@@ -61,12 +62,12 @@ impl ScheduleDisplay {
     pub fn get_next_execution_times(task: &TaskConfig, from: DateTime<Tz>, count: usize) -> Vec<DateTime<Tz>> {
         let mut times = Vec::new();
         let mut current = from;
-        let mut pending_task = PendingTask::new(task.clone());
+        let mut pending_task = PendingTask::new(Arc::new(task.clone()));
         let mut current_instant = Instant::now();
         let mut first = true;
 
         for _ in 0..count {
-            let next = Scheduler::get_next_execution_time(&pending_task, current);
+            let next = Scheduler::get_next_execution_time(&pending_task, current, false);
             times.push(next);
 
             let mut diff = next.timestamp() - current.timestamp();
@@ -86,10 +87,8 @@ impl ScheduleDisplay {
             let duration = std::time::Duration::from_secs(diff as u64);
 
             if first {
-                pending_task.last_execution = Some(current_instant + duration);
                 pending_task.last_execution_time = Some((current + duration).to_utc());
             } else {
-                pending_task.last_execution = Some(current_instant);
                 pending_task.last_execution_time = Some(current.to_utc());
             }
 
