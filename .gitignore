@@ -5,3 +5,7 @@ stdout.log
 stderr.log
 crontab_config.yml
 cron-rs_scheduler_state.json
+config.yml
+test_config.yml
+test_config_failure.yml
+test_execution_logs.db
