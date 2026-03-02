@@ -17,6 +17,7 @@ use crate::config::file::ExplodedTimePatternConfig;
 use crate::config::file::ExplodedTimePatternFieldConfig;
 use crate::config::file::TaskDefinition;
 use crate::config::file::TimePatternConfig;
+use crate::config::file::validate_config_path;
 use crate::config::logging::LoggingConfig;
 use crate::scheduler::Scheduler;
 use crate::schedule_display::ScheduleDisplay;
@@ -130,39 +131,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_run(config_path: PathBuf) -> anyhow::Result<()> {
-    match std::fs::metadata(&config_path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err(anyhow!("Config path {} is not a file", config_path.to_string_lossy()));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-
-                if metadata.mode() & 0o002 != 0 {
-                    let error = anyhow!(concat!(
-                        "Config file {} is globally writable by any user.\n",
-                        "###\n",
-                        "THIS IS MAYOR SECURITY RISK\n",
-                        "###\n",
-                        "Any user can alter the config file and add tasks that will be run with the current user's permissions.\n",
-                        "Refusing to run with insecure file permissions (mod {:o})"
-                    ),
-                        config_path.to_string_lossy(),
-                        (metadata.mode() & 0o777)
-                    );
-                    return Err(error);
-                }
-            }
-        }
-        Err(e) => {
-            return Err(anyhow!(
-                "Failed to read config file {}: {}",
-                config_path.to_string_lossy(),
-                e
-            ));
-        }
-    }
+    validate_config_path(&config_path)?;
 
     let config_file = read_config_file(&config_path)?;
     let config = parse_config_file(&config_file)?;
@@ -170,7 +139,7 @@ fn cmd_run(config_path: PathBuf) -> anyhow::Result<()> {
 
     info!("Starting cron-rs with config file: {}", config_path.to_string_lossy());
 
-    Scheduler::new(config).run();
+    Scheduler::new(config, config_path).run();
 
     info!("Exiting");
     Ok(())

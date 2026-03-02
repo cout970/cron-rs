@@ -81,6 +81,46 @@ pub enum ExplodedTimePatternFieldConfig {
     List(Vec<String>),
 }
 
+/// Validates that the config file exists, is a regular file, and has secure permissions.
+pub fn validate_config_path(config_path: &Path) -> anyhow::Result<()> {
+    match std::fs::metadata(config_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(anyhow::anyhow!(
+                    "Config path {} is not a file",
+                    config_path.to_string_lossy()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                if metadata.mode() & 0o002 != 0 {
+                    let error = anyhow::anyhow!(
+                        concat!(
+                            "Config file {} is globally writable by any user.\n",
+                            "###\n",
+                            "THIS IS MAYOR SECURITY RISK\n",
+                            "###\n",
+                            "Any user can alter the config file and add tasks that will be run with the current user's permissions.\n",
+                            "Refusing to run with insecure file permissions (mod {:o})"
+                        ),
+                        config_path.to_string_lossy(),
+                        (metadata.mode() & 0o777)
+                    );
+                    return Err(error);
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to read config file {}: {}",
+            config_path.to_string_lossy(),
+            e
+        )),
+    }
+}
+
 pub fn read_config_file<P: AsRef<Path>>(path: P) -> anyhow::Result<ConfigFile> {
     let content = std::fs::read_to_string(path).context("Failed to read config file")?;
     let config = serde_yml::from_str(&content).context("Failed to parse config file")?;

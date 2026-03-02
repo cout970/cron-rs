@@ -328,7 +328,7 @@ mod tests {
         TaskConfig {
             name: name.to_string(),
             cmd: cmd.to_string(),
-            schedule: Schedule::Every { interval: StdDuration::from_secs(60) },
+            schedule: Schedule::Every { interval: StdDuration::from_secs(60), aligned: false },
             timezone: UTC,
             avoid_overlapping: false,
             run_as: None,

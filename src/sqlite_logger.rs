@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 const DB_SCHEMA_VERSION: i32 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SqliteLoggerConfig {
     pub enabled: bool,
     pub database_path: PathBuf,

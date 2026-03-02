@@ -1,4 +1,6 @@
 use crate::alerts::{send_alert, Alert, AlertConfig, TaskExecutionDetails};
+use crate::config::file::{read_config_file, validate_config_path};
+use crate::config::parse_config_file;
 use crate::config::{Config, Schedule, TaskConfig, TimePatternField};
 use crate::sqlite_logger::{ExecutionAttempt, ExecutionFailure, ExecutionSuccess, SqliteLogger};
 use crate::utils::format_duration;
@@ -56,19 +58,23 @@ pub struct Scheduler {
     tasks: Vec<Arc<TaskConfig>>,
     active_tasks: Vec<ActiveTask>,
     pending_tasks: Vec<Arc<Mutex<PendingTask>>>,
-    async_handles: Vec<JoinHandle<()>>,
+    task_loop_handles: Vec<JoinHandle<()>>,
+    wait_handles: Vec<JoinHandle<()>>,
     config: Config,
+    config_path: PathBuf,
     sqlite_logger: Option<SqliteLogger>,
 }
 
 impl Scheduler {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, config_path: PathBuf) -> Self {
         Scheduler {
             tasks: config.tasks.clone(),
             active_tasks: Vec::new(),
             pending_tasks: Vec::new(),
-            async_handles: Vec::new(),
+            task_loop_handles: Vec::new(),
+            wait_handles: Vec::new(),
             config,
+            config_path,
             sqlite_logger: None,
         }
     }
@@ -133,6 +139,88 @@ impl Scheduler {
         }
     }
 
+    async fn reload_config(&mut self) -> anyhow::Result<usize> {
+        // Validate and read the new config
+        validate_config_path(&self.config_path)?;
+        let config_file = read_config_file(&self.config_path)?;
+        let new_config = parse_config_file(&config_file)?;
+
+        // Save current state before tearing down
+        self.save_state().await;
+
+        // Build a map of task_name -> (last_execution_time, last_pid, retries) from existing pending tasks
+        let mut state_map: HashMap<String, PendingTask> = HashMap::new();
+        for pt_mutex in &self.pending_tasks {
+            let pt = pt_mutex.lock().await;
+            state_map.insert(pt.config.name.clone(), pt.clone());
+        }
+
+        // Abort all task loop handles (they stop at their next await point)
+        for handle in self.task_loop_handles.drain(..) {
+            handle.abort();
+        }
+
+        // Clean up finished wait handles (running subprocesses keep their handles)
+        self.wait_handles.retain(|h| !h.is_finished());
+
+        // Detect added/removed/retained tasks
+        let old_names: std::collections::HashSet<&str> = state_map.keys().map(|s| s.as_str()).collect();
+        let new_names: std::collections::HashSet<&str> = new_config.tasks.iter().map(|t| t.name.as_str()).collect();
+
+        let added: Vec<&str> = new_names.difference(&old_names).copied().collect();
+        let removed: Vec<&str> = old_names.difference(&new_names).copied().collect();
+        let retained: Vec<&str> = new_names.intersection(&old_names).copied().collect();
+
+        if !added.is_empty() {
+            info!("New tasks added: {}", added.join(", "));
+        }
+        if !removed.is_empty() {
+            info!("Tasks removed: {}", removed.join(", "));
+        }
+        if !retained.is_empty() {
+            info!("Tasks retained: {}", retained.join(", "));
+        }
+
+        // Warn if logging config changed (env_logger can only be initialized once)
+        if new_config.logging != self.config.logging {
+            warn!("Logging configuration changed, but logging cannot be reconfigured at runtime. Restart to apply logging changes.");
+        }
+
+        // Update config and tasks
+        self.config = new_config;
+        self.tasks = self.config.tasks.clone();
+
+        // Reinitialize SQLite logger if configured
+        self.sqlite_logger = None;
+        if let Some(sqlite_config) = &self.config.logging.sqlite {
+            if sqlite_config.enabled {
+                match SqliteLogger::new(sqlite_config.clone()).await {
+                    Ok(logger) => {
+                        self.sqlite_logger = Some(logger);
+                    }
+                    Err(e) => {
+                        error!("Failed to reinitialize SQLite logger: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Create new PendingTasks, restoring state for tasks that still exist by name
+        let mut new_pending_tasks = Vec::new();
+        for task_config in &self.tasks {
+            let mut new_task = PendingTask::new(task_config.clone());
+            if let Some(prev_task) = state_map.get(&task_config.name) {
+                new_task.last_execution_time = prev_task.last_execution_time;
+                new_task.last_pid = prev_task.last_pid;
+                new_task.retries = prev_task.retries;
+            }
+            new_pending_tasks.push(Arc::new(Mutex::new(new_task)));
+        }
+        self.pending_tasks = new_pending_tasks;
+
+        Ok(self.tasks.len())
+    }
+
     async fn run_async(mutex: Arc<Mutex<Scheduler>>) -> anyhow::Result<()> {
         // Initialize SQLite logger if configured
         {
@@ -166,25 +254,16 @@ impl Scheduler {
         info!("Initializing scheduler with {} tasks", pending_tasks.len());
 
         // Spawn task execution tasks
-        for pending_task_mutex in pending_tasks {
-            let scheduler_mutex = mutex.clone();
-
-            let handle = tokio::spawn(async move {
-                Self::execute_task_loop(pending_task_mutex, scheduler_mutex).await;
-            });
-
-            {
-                let mut scheduler = mutex.lock().await;
-                scheduler.async_handles.push(handle);
-            }
-        }
+        Self::spawn_tasks(mutex.clone(), pending_tasks);
 
         // Wait for Ctrl+C signal to stop the infinite loop
         let ctrl_c = signal::ctrl_c();
         let mut sigusr1 = signal::unix::signal(SignalKind::user_defined1()).expect("Failed to register SIGUSR1");
+        let mut sighup = signal::unix::signal(SignalKind::hangup()).expect("Failed to register SIGHUP");
 
         tokio::pin!(ctrl_c);
         tokio::pin!(sigusr1);
+        tokio::pin!(sighup);
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => {
@@ -193,7 +272,10 @@ impl Scheduler {
                         let mut scheduler = mutex.lock().await;
                         scheduler.save_state().await;
 
-                        for handle in &scheduler.async_handles {
+                        for handle in &scheduler.task_loop_handles {
+                            handle.abort();
+                        }
+                        for handle in &scheduler.wait_handles {
                             handle.abort();
                         }
                     }
@@ -206,10 +288,45 @@ impl Scheduler {
                         scheduler.save_state().await;
                     }
                 }
+                _ = sighup.recv() => {
+                    info!("Received SIGHUP, reloading configuration");
+                    {
+                        let mut scheduler = mutex.lock().await;
+                        match scheduler.reload_config().await {
+                            Ok(task_count) => {
+                                info!("Configuration reloaded successfully with {} tasks", task_count);
+
+                                // Re-spawn task loops for the new tasks
+                                let pending_tasks = scheduler.pending_tasks.clone();
+                                drop(scheduler);
+
+                                Self::spawn_tasks(mutex.clone(), pending_tasks);
+                            }
+                            Err(e) => {
+                                error!("Failed to reload configuration: {}. Keeping existing config.", e);
+                            }
+                        }
+                    }
+                }
             }
         }
 
         Ok(())
+    }
+
+    async fn spawn_tasks(mutex: Arc<Mutex<Scheduler>>, pending_tasks: Vec<Arc<Mutex<PendingTask>>>) {
+        for pending_task_mutex in pending_tasks {
+            let scheduler_mutex = mutex.clone();
+
+            let handle = tokio::spawn(async move {
+                Self::execute_task_loop(pending_task_mutex, scheduler_mutex).await;
+            });
+
+            {
+                let mut scheduler = mutex.lock().await;
+                scheduler.task_loop_handles.push(handle);
+            }
+        }
     }
 
     async fn execute_task_loop(pending_task_mutex: Arc<Mutex<PendingTask>>, scheduler_mutex: Arc<Mutex<Scheduler>>) {
@@ -352,7 +469,7 @@ impl Scheduler {
 
         {
             let mut scheduler = mutex.lock().await;
-            scheduler.async_handles.push(handle);
+            scheduler.wait_handles.push(handle);
         }
     }
 

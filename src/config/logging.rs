@@ -13,7 +13,7 @@ pub enum LogOutput {
     Syslog,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LoggingConfig {
     pub output: LogOutput,
     #[serde(skip_serializing_if = "Option::is_none")]
