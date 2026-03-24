@@ -29,6 +29,15 @@ impl ScheduleDisplay {
         output.push_str(&format!("Task: {}\n", task.name));
         output.push_str(&format!("Command: {}\n", task.cmd));
         output.push_str(&format!("Timezone: {}\n", task.timezone));
+        if let Some(run_as) = &task.run_as {
+            output.push_str(&format!("Run as: {}\n", run_as));
+        }
+        if let Some(shell) = &task.shell {
+            output.push_str(&format!("Shell: {}\n", shell));
+        }
+        if task.avoid_overlapping {
+            output.push_str("Without overlap\n");
+        }
 
         match &task.schedule {
             Schedule::Every { interval, aligned } => {

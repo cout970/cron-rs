@@ -18,8 +18,8 @@
 - [x] Warning if config file is writable by other users
 - [ ] Add support for more time expressions, like systemd https://silentlad.com/systemd-timers-oncalendar-(cron)-format-explained
 - [ ] Add support for multiple config files, one per user, with implicit "run_as", like crontab files
-- [ ] Alerts on failure/success (per task)
-- [ ] Allow to run a task manually
+- [x] Alerts on failure/success (per task)
+- [x] Allow to run a task manually
 - [ ] Allow to run a task only once, execute today at 8:30
 - [ ] Allow to run multiple commands and wait for one to finish before running the next one
 - [ ] Allow to schedule a task to a unix timestamp
@@ -27,15 +27,17 @@
 - [ ] Allow to wait a random amount of time before running a command to avoid conflicts
 - [ ] Conditional exec if file exists
 - [ ] Custom validation for task success state
-- [ ] Debug print tasks to run in time interval, without executing them
+- [x] Debug print tasks to run in time interval, without executing them
 - [ ] Detect clock changes and warn user
+- [ ] Background thread to detect stalled tasks/locked program
 - [ ] Execution delay when the parallel execution is not allowed and an execution is already running
-- [ ] Hot reload config file changes without restarting the service
+- [x] Hot reload config file changes without restarting the service
 - [ ] Import from systemd timers
+- [x] Import from crontab
 - [ ] Load secrets from file
-- [ ] Log format: sqlite table (not only logs, but tracking execution time, errors and other metadata so it can be queried)
+- [x] Log format: sqlite table (not only logs, but tracking execution time, errors and other metadata so it can be queried)
 - [ ] Retries on error
 - [ ] Run inside docker container
-- [ ] Show schedule of tasks, next exec, last exec, remaining time, etc.
+- [x] Show schedule of tasks, next exec, last exec, remaining time, etc.
 - [ ] Subtasks
 - [ ] Use env vars from .env file in config

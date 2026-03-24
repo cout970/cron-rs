@@ -1,6 +1,5 @@
 use crate::alerts::{send_alert, Alert, AlertConfig, TaskExecutionDetails};
-use crate::config::file::{read_config_file, validate_config_path};
-use crate::config::parse_config_file;
+use crate::config::loader::ConfigLoader;
 use crate::config::{Config, Schedule, TaskConfig, TimePatternField};
 use crate::sqlite_logger::{ExecutionAttempt, ExecutionFailure, ExecutionSuccess, SqliteLogger};
 use crate::utils::format_duration;
@@ -61,12 +60,12 @@ pub struct Scheduler {
     task_loop_handles: Vec<JoinHandle<()>>,
     wait_handles: Vec<JoinHandle<()>>,
     config: Config,
-    config_path: PathBuf,
+    loader: ConfigLoader,
     sqlite_logger: Option<SqliteLogger>,
 }
 
 impl Scheduler {
-    pub fn new(config: Config, config_path: PathBuf) -> Self {
+    pub fn new(config: Config, loader: ConfigLoader) -> Self {
         Scheduler {
             tasks: config.tasks.clone(),
             active_tasks: Vec::new(),
@@ -74,7 +73,7 @@ impl Scheduler {
             task_loop_handles: Vec::new(),
             wait_handles: Vec::new(),
             config,
-            config_path,
+            loader,
             sqlite_logger: None,
         }
     }
@@ -140,10 +139,7 @@ impl Scheduler {
     }
 
     async fn reload_config(&mut self) -> anyhow::Result<usize> {
-        // Validate and read the new config
-        validate_config_path(&self.config_path)?;
-        let config_file = read_config_file(&self.config_path)?;
-        let new_config = parse_config_file(&config_file)?;
+        let new_config = self.loader.load()?;
 
         // Save current state before tearing down
         self.save_state().await;

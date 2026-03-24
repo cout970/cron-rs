@@ -2,31 +2,27 @@
 
 mod config;
 mod logging;
+mod schedule_display;
 mod scheduler;
 mod sqlite_logger;
 mod task_executor;
-mod schedule_display;
 
 mod alerts;
 
 mod utils;
 
 use crate::alerts::AlertConfig;
+use crate::config::cron::parse_crontab_file;
 use crate::config::file::ConfigFile;
-use crate::config::file::ExplodedTimePatternConfig;
-use crate::config::file::ExplodedTimePatternFieldConfig;
-use crate::config::file::TaskDefinition;
-use crate::config::file::TimePatternConfig;
-use crate::config::file::validate_config_path;
+use crate::config::loader::ConfigLoader;
 use crate::config::logging::LoggingConfig;
-use crate::scheduler::Scheduler;
 use crate::schedule_display::ScheduleDisplay;
+use crate::scheduler::Scheduler;
 use crate::sqlite_logger::SqliteLogger;
 use crate::task_executor::TaskExecutor;
+use crate::utils::format_duration;
 use anyhow::anyhow;
 use clap::{Parser, Subcommand};
-use config::file::read_config_file;
-use config::parse_config_file;
 use config::validation::{validate_config, ValidationResult};
 use log::{debug, error, info, warn, LevelFilter};
 use std::io::{stdout, Write};
@@ -38,6 +34,13 @@ struct Args {
     /// Path to the config file
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    /// Load extra tasks from system crontab files: /etc/crontab, /etc/cron.d/*, and
+    /// scripts in /etc/cron.hourly/, /etc/cron.daily/, /etc/cron.weekly/, /etc/cron.monthly/.
+    /// Allows using cron-rs as a drop-in cron replacement.
+    /// Applies to: run, validate, execute-task, show-schedule.
+    #[arg(long, global = true)]
+    cron_compat: bool,
 
     #[command(subcommand)]
     cmd: ArgCmd,
@@ -72,7 +75,7 @@ enum ArgCmd {
         #[arg(long, short)]
         output: Option<PathBuf>,
     },
-    /// Look up the current user's crontab file and genera an equivalent config file
+    /// Look up the current user's crontab file and generate an equivalent config file
     GenerateFromCrontab {
         /// Path to the crontab file to read
         #[arg(long, short = 'f')]
@@ -86,75 +89,69 @@ enum ArgCmd {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let cron_compat = args.cron_compat;
 
     match args.cmd {
         ArgCmd::Run => {
-            cmd_run(get_config_path(args.config)?)?;
-            Ok(())
+            let loader = ConfigLoader::new(get_config_path(args.config)?, cron_compat);
+            cmd_run(loader)?;
         }
         ArgCmd::Validate { path } => {
-            let path = if let Some(path) = path {
-                path
-            } else {
-                get_config_path(args.config)?
-            };
-            cmd_validate_config_file(path)?;
-            Ok(())
+            let path = path.map(Ok).unwrap_or_else(|| get_config_path(args.config))?;
+            let loader = ConfigLoader::new(path, cron_compat);
+            cmd_validate_config_file(loader)?;
         }
         ArgCmd::ExecuteTask { task_name, config } => {
-            let config_path = if let Some(config) = config {
-                config
-            } else {
-                get_config_path(args.config)?
-            };
-            cmd_execute_task(config_path, task_name)?;
-            Ok(())
+            let config_path = config.map(Ok).unwrap_or_else(|| get_config_path(args.config))?;
+            let loader = ConfigLoader::new(config_path, cron_compat);
+            cmd_execute_task(loader, task_name)?;
         }
         ArgCmd::ShowSchedule { config } => {
-            let config_path = if let Some(config) = config {
-                config
-            } else {
-                get_config_path(args.config)?
-            };
-            cmd_show_schedule(config_path)?;
-            Ok(())
+            let config_path = config.map(Ok).unwrap_or_else(|| get_config_path(args.config))?;
+            let loader = ConfigLoader::new(config_path, cron_compat);
+            cmd_show_schedule(loader)?;
         }
         ArgCmd::GenerateConfig { output } => {
+            if cron_compat {
+                eprintln!("warning: --cron-compat has no effect on generate-config");
+            }
             cmd_generate_default_config(output)?;
-            Ok(())
         }
         ArgCmd::GenerateFromCrontab { output, crontab_file } => {
+            if cron_compat {
+                eprintln!("warning: --cron-compat has no effect on generate-from-crontab");
+            }
             cmd_generate_config_from_crontab(output, crontab_file)?;
-            Ok(())
         }
     }
+
+    Ok(())
 }
 
-fn cmd_run(config_path: PathBuf) -> anyhow::Result<()> {
-    validate_config_path(&config_path)?;
-
-    let config_file = read_config_file(&config_path)?;
-    let config = parse_config_file(&config_file)?;
+fn cmd_run(loader: ConfigLoader) -> anyhow::Result<()> {
+    let config = loader.load()?;
     logging::setup_logging(&config.logging)?;
 
-    info!("Starting cron-rs with config file: {}", config_path.to_string_lossy());
+    info!("Starting cron-rs with config file: {}", loader.path.display());
 
-    Scheduler::new(config, config_path).run();
+    Scheduler::new(config, loader).run();
 
     info!("Exiting");
     Ok(())
 }
 
-fn cmd_execute_task(config_path: PathBuf, task_name: String) -> anyhow::Result<()> {
+fn cmd_execute_task(loader: ConfigLoader, task_name: String) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let config_file = read_config_file(&config_path)?;
-        let config = parse_config_file(&config_file)?;
-        
+        let config = loader.load()?;
+
         // Find the task
-        let task = config.tasks.iter().find(|t| t.name == task_name)
+        let task = config
+            .tasks
+            .iter()
+            .find(|t| t.name == task_name)
             .ok_or_else(|| anyhow!("Task '{}' not found", task_name))?;
-        
+
         // Initialize SQLite logger if configured
         let sqlite_logger = if let Some(sqlite_config) = &config.logging.sqlite {
             if sqlite_config.enabled {
@@ -171,10 +168,10 @@ fn cmd_execute_task(config_path: PathBuf, task_name: String) -> anyhow::Result<(
         } else {
             None
         };
-        
+
         // Create task executor
         let executor = TaskExecutor::new(config.alerts, sqlite_logger);
-        
+
         // Execute the task
         println!("Executing task '{}'...", task_name);
         match executor.execute_task(task).await {
@@ -182,9 +179,9 @@ fn cmd_execute_task(config_path: PathBuf, task_name: String) -> anyhow::Result<(
                 println!("Task '{}' completed:", task_name);
                 println!("  Status: {}", if result.success { "Success" } else { "Failed" });
                 println!("  Exit code: {}", result.exit_code);
-                println!("  Duration: {}", crate::utils::format_duration(result.duration));
+                println!("  Duration: {}", format_duration(result.duration));
                 println!("  PID: {}", result.pid);
-                
+
                 if !result.stdout.is_empty() {
                     println!("  Stdout: {}", result.stdout.trim());
                 }
@@ -197,22 +194,18 @@ fn cmd_execute_task(config_path: PathBuf, task_name: String) -> anyhow::Result<(
                 std::process::exit(1);
             }
         }
-        
+
         Ok(())
     })
 }
 
-fn cmd_show_schedule(config_path: PathBuf) -> anyhow::Result<()> {
-    let config_file = read_config_file(&config_path)?;
-    let config = parse_config_file(&config_file)?;
-    
-    let schedule_display = ScheduleDisplay::display_schedules(&config);
-    println!("{}", schedule_display);
-    
+fn cmd_show_schedule(loader: ConfigLoader) -> anyhow::Result<()> {
+    let config = loader.load()?;
+    println!("{}", ScheduleDisplay::display_schedules(&config));
     Ok(())
 }
 
-fn cmd_validate_config_file(path: PathBuf) -> anyhow::Result<()> {
+fn cmd_validate_config_file(loader: ConfigLoader) -> anyhow::Result<()> {
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
         .format_timestamp(None)
@@ -224,33 +217,26 @@ fn cmd_validate_config_file(path: PathBuf) -> anyhow::Result<()> {
         .format_line_number(false)
         .init();
 
-    let config_file = read_config_file(path)?;
-    let info = validate_config(&config_file);
+    let config_file = loader.load_file()?;
+    let results = validate_config(&config_file);
 
-    for msg in &info {
+    for msg in &results {
         match msg {
-            ValidationResult::Error(m) => {
-                error!("{}", m);
-            }
-            ValidationResult::Warning(m) => {
-                warn!("{}", m);
-            }
+            ValidationResult::Error(m) => error!("{}", m),
+            ValidationResult::Warning(m) => warn!("{}", m),
         }
     }
 
-    if info.is_empty() {
+    if results.is_empty() {
         info!("Config file is valid");
     }
     Ok(())
 }
 
 fn cmd_generate_config_from_crontab(path: Option<PathBuf>, crontab_file: Option<PathBuf>) -> anyhow::Result<()> {
-    // Crontab file contents
     let crontab = if let Some(crontab_file) = crontab_file {
-        // If a file path is provided, read the crontab from that file
         std::fs::read_to_string(crontab_file).map_err(|e| anyhow::anyhow!("Failed to read crontab: {}", e))?
     } else {
-        // If no path is provided, use the crontab command to get the current user's crontab
         let output = std::process::Command::new("crontab")
             .arg("-l")
             .output()
@@ -286,7 +272,6 @@ fn cmd_generate_default_config(path: Option<PathBuf>) -> anyhow::Result<()> {
 fn print_config_file(contents: &[u8], path: &Option<PathBuf>) -> anyhow::Result<()> {
     match path {
         Some(path) => {
-            // Validate the file is writable or does not exist and the directory is writable
             if path.exists() {
                 if !path.is_file() {
                     return Err(anyhow::anyhow!("Path {} is not a file", path.to_string_lossy()));
@@ -294,19 +279,16 @@ fn print_config_file(contents: &[u8], path: &Option<PathBuf>) -> anyhow::Result<
                 if path.metadata()?.permissions().readonly() {
                     return Err(anyhow::anyhow!("File {} is not writable", path.to_string_lossy()));
                 }
-            } else {
-                if let Some(parent) = path.parent() {
-                    if !parent.is_dir() || parent.metadata()?.permissions().readonly() {
-                        return Err(anyhow::anyhow!(
-                            "Directory {} is not writable",
-                            parent.to_string_lossy(),
-                        ));
-                    }
+            } else if let Some(parent) = path.parent() {
+                if !parent.is_dir() || parent.metadata()?.permissions().readonly() {
+                    return Err(anyhow::anyhow!(
+                        "Directory {} is not writable",
+                        parent.to_string_lossy(),
+                    ));
                 }
             }
 
             std::fs::write(&path, contents).expect("Unable to write file");
-
             println!("Generated config file at {}", path.to_string_lossy());
         }
         None => {
@@ -316,116 +298,13 @@ fn print_config_file(contents: &[u8], path: &Option<PathBuf>) -> anyhow::Result<
     Ok(())
 }
 
-fn parse_crontab_file(crontab: &str) -> anyhow::Result<Vec<TaskDefinition>> {
-    let mut tasks = vec![];
-    let mut last_comment = String::new();
-
-    for line in crontab.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            last_comment.clear();
-            continue;
-        }
-
-        if line.starts_with('#') {
-            last_comment.push_str(" ");
-            last_comment.push_str(line[1..].trim());
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            last_comment.clear();
-            continue;
-        }
-
-        let (minute, hour, day, month, day_of_week) = (parts[0], parts[1], parts[2], parts[3], parts[4]);
-        let cmd = parts[5..].join(" ");
-
-        let name = if last_comment.trim().is_empty() {
-            format!("Crontab: {}", line)
-        } else {
-            last_comment.trim().to_string()
-        };
-
-        let map = |s: &str| {
-            let mut text = s.replace("-", "..");
-            if text.contains(',') {
-                let options: Vec<String> = text.split(',').map(|s| s.trim().to_string()).collect();
-
-                let mut result = vec![];
-
-                for opt in options {
-                    if opt.contains("..") {
-                        let range_parts: Vec<&str> = opt.split("..").collect();
-                        if range_parts.len() != 2 {
-                            warn!("Found invalid range format in crontab, ignoring: {}", opt);
-                            continue;
-                        }
-
-                        let (start, end) = match (range_parts[0].parse::<u32>(), range_parts[1].parse::<u32>()) {
-                            (Ok(start), Ok(end)) => (start, end),
-                            _ => {
-                                warn!("Found non-numeric range in crontab, ignoring: {}", opt);
-                                continue;
-                            }
-                        };
-
-                        if start > end {
-                            warn!("Found invalid range in crontab, ignoring: {}", opt);
-                            continue;
-                        }
-
-                        for i in start..=end {
-                            result.push(i.to_string());
-                        }
-                    } else {
-                        result.push(opt);
-                    }
-                }
-
-                if result.len() == 1 {
-                    let first = result.into_iter().next().unwrap();
-                    ExplodedTimePatternFieldConfig::Text(first)
-                } else {
-                    let list = format!("[{}]", result.join(", "));
-                    ExplodedTimePatternFieldConfig::Text(list)
-                }
-            } else {
-                ExplodedTimePatternFieldConfig::Text(text)
-            }
-        };
-
-        let task = TaskDefinition {
-            name,
-            cmd,
-            when: Some(TimePatternConfig::Long(ExplodedTimePatternConfig {
-                second: None,
-                minute: Some(map(minute)),
-                hour: Some(map(hour)),
-                day: Some(map(day)),
-                month: Some(map(month)),
-                year: None,
-                day_of_week: Some(map(day_of_week)),
-            })),
-            ..Default::default()
-        };
-
-        tasks.push(task);
-    }
-
-    Ok(tasks)
-}
-
 fn get_config_path(mut config_path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    // If not provided, check in the current directory for `config.yml`
     if config_path.is_none() {
         if std::fs::exists("./config.yml")? {
             config_path = Some(PathBuf::from("./config.yml"));
         }
     }
 
-    // or check in the default config directory `$XDG_CONFIG_HOME/cron-rs` or `$HOME/.config/cron-rs`
     if config_path.is_none() {
         let config_location = if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
             format!("{}/cron-rs/config.yml", dir)
@@ -440,19 +319,9 @@ fn get_config_path(mut config_path: Option<PathBuf>) -> anyhow::Result<PathBuf> 
         }
     }
 
-    // or check the system-wide config directory `/etc/cron-rs.yml`
-    if config_path.is_none() {
-        if std::fs::exists("/etc/cron-rs.yml")? {
-            config_path = Some(PathBuf::from("/etc/cron-rs.yml"));
-        }
+    if config_path.is_none() && std::fs::exists("/etc/cron-rs.yml")? {
+        config_path = Some(PathBuf::from("/etc/cron-rs.yml"));
     }
 
-    // Not specified and not found in any of the default locations
-    if config_path.is_none() {
-        return Err(anyhow!(
-            "No config file found. Please specify a config file with --config"
-        ));
-    }
-
-    Ok(config_path.unwrap())
+    config_path.ok_or_else(|| anyhow!("No config file found. Please specify a config file with --config"))
 }
