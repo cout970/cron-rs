@@ -6,6 +6,7 @@ pub mod logging;
 pub mod shorthand;
 pub mod timeunit;
 pub mod validation;
+pub mod watchdog;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::TimeZone;
@@ -24,6 +25,7 @@ use self::file::ExplodedTimePatternFieldConfig;
 use self::file::{ConfigFile, ExplodedTimePatternConfig, TaskDefinition, TimePatternConfig};
 use self::logging::LoggingConfig;
 use self::timeunit::TimeUnit;
+use self::watchdog::WatchdogConfig;
 
 use log::warn;
 use std::collections::HashMap;
@@ -56,6 +58,7 @@ pub struct Config {
     pub tasks: Vec<Arc<TaskConfig>>,
     pub logging: LoggingConfig,
     pub alerts: AlertConfig,
+    pub watchdog: WatchdogConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,7 @@ pub fn parse_config_file(file: &ConfigFile) -> Result<Config> {
         tasks,
         logging: logging_config,
         alerts: file.alerts.clone().unwrap_or_default(),
+        watchdog: file.watchdog.clone().unwrap_or_default(),
     })
 }
 

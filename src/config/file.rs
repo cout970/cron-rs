@@ -6,12 +6,14 @@ use std::collections::HashMap;
 use std::ops::Not;
 use crate::alerts::{Alert, AlertConfig};
 use super::logging::LoggingConfig;
+use super::watchdog::WatchdogConfig;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ConfigFile {
     pub tasks: Vec<TaskDefinition>,
     pub logging: Option<LoggingConfig>,
     pub alerts: Option<AlertConfig>,
+    pub watchdog: Option<WatchdogConfig>,
 }
 
 #[skip_serializing_none]

@@ -1,6 +1,8 @@
 use crate::alerts::{send_alert, Alert, AlertConfig, TaskExecutionDetails};
 use crate::config::loader::ConfigLoader;
+use crate::config::watchdog::WatchdogConfig;
 use crate::config::{Config, Schedule, TaskConfig, TimePatternField};
+use crate::watchdog;
 use crate::sqlite_logger::{ExecutionAttempt, ExecutionFailure, ExecutionSuccess, SqliteLogger};
 use crate::utils::format_duration;
 use anyhow::anyhow;
@@ -18,6 +20,7 @@ use std::os::unix::prelude::CommandExt;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{Gid, Groups, ProcessStatus, User, Users};
@@ -62,10 +65,23 @@ pub struct Scheduler {
     config: Config,
     loader: ConfigLoader,
     sqlite_logger: Option<SqliteLogger>,
+    /// Epoch-seconds timestamp updated every few seconds by a dedicated tokio task.
+    /// The watchdog thread reads this to detect a frozen async runtime.
+    heartbeat: Arc<AtomicU64>,
+    /// Shared watchdog config so the background thread picks up hot-reload changes.
+    watchdog_config: Arc<RwLock<WatchdogConfig>>,
 }
 
 impl Scheduler {
     pub fn new(config: Config, loader: ConfigLoader) -> Self {
+        let watchdog_config = Arc::new(RwLock::new(config.watchdog.clone()));
+        // Initialize heartbeat to now so the watchdog doesn't fire immediately on startup.
+        let heartbeat = Arc::new(AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ));
         Scheduler {
             tasks: config.tasks.clone(),
             active_tasks: Vec::new(),
@@ -75,6 +91,8 @@ impl Scheduler {
             config,
             loader,
             sqlite_logger: None,
+            heartbeat,
+            watchdog_config,
         }
     }
 
@@ -140,6 +158,11 @@ impl Scheduler {
 
     async fn reload_config(&mut self) -> anyhow::Result<usize> {
         let new_config = self.loader.load()?;
+
+        // Propagate new watchdog settings to the background thread.
+        if let Ok(mut guard) = self.watchdog_config.write() {
+            *guard = new_config.watchdog.clone();
+        }
 
         // Save current state before tearing down
         self.save_state().await;
@@ -234,6 +257,30 @@ impl Scheduler {
                 }
             }
         }
+
+        // Spawn the heartbeat tokio task — keeps the watchdog's liveness check happy.
+        // The task updates an atomic counter every few seconds. If the tokio runtime
+        // freezes, the counter stops updating and the watchdog detects it.
+        let (heartbeat, watchdog_config) = {
+            let s = mutex.lock().await;
+            (Arc::clone(&s.heartbeat), Arc::clone(&s.watchdog_config))
+        };
+        {
+            let hb = Arc::clone(&heartbeat);
+            tokio::spawn(async move {
+                loop {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    hb.store(ts, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
+        }
+
+        // Start the watchdog background thread (fire-and-forget; dies with the process).
+        watchdog::spawn(watchdog_config, Arc::clone(&heartbeat));
 
         let pending_tasks: Vec<Arc<Mutex<PendingTask>>> = {
             let mut scheduler = mutex.lock().await;

@@ -6,6 +6,7 @@ mod schedule_display;
 mod scheduler;
 mod sqlite_logger;
 mod task_executor;
+mod watchdog;
 
 mod alerts;
 
