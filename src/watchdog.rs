@@ -76,15 +76,13 @@ fn run(config: Arc<RwLock<WatchdogConfig>>, heartbeat: Arc<AtomicU64>) {
                 if shift > 0.0 {
                     warn!(
                         "Watchdog: wall clock jumped forward by ~{:.0}s \
-                         (VM resume or NTP step-forward). \
-                         Task execution times have been adjusted accordingly.",
+                         (VM resume or NTP step-forward).",
                         shift
                     );
                 } else {
                     warn!(
                         "Watchdog: wall clock jumped backward by ~{:.0}s \
-                         (NTP correction or manual change). \
-                         Task execution times have been adjusted accordingly.",
+                         (NTP correction or manual change).",
                         -shift
                     );
                 }
