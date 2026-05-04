@@ -274,7 +274,7 @@ impl Scheduler {
                         .unwrap_or_default()
                         .as_secs();
                     hb.store(ts, Ordering::Relaxed);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    sleep(Duration::from_secs(5)).await;
                 }
             });
         }
@@ -297,7 +297,7 @@ impl Scheduler {
         info!("Initializing scheduler with {} tasks", pending_tasks.len());
 
         // Spawn task execution tasks
-        Self::spawn_tasks(mutex.clone(), pending_tasks);
+        Self::spawn_tasks(mutex.clone(), pending_tasks).await;
 
         // Wait for Ctrl+C signal to stop the infinite loop
         let ctrl_c = signal::ctrl_c();
@@ -343,7 +343,7 @@ impl Scheduler {
                                 let pending_tasks = scheduler.pending_tasks.clone();
                                 drop(scheduler);
 
-                                Self::spawn_tasks(mutex.clone(), pending_tasks);
+                                Self::spawn_tasks(mutex.clone(), pending_tasks).await;
                             }
                             Err(e) => {
                                 error!("Failed to reload configuration: {}. Keeping existing config.", e);
@@ -376,8 +376,8 @@ impl Scheduler {
         // Wait loop for the right time to execute the task
         loop {
             let pending_task_copy: PendingTask = { pending_task_mutex.lock().await.clone() };
-
             let start = Instant::now();
+
             // Check if the task must be executed now
             if !Self::is_task_ready_for_execution(&pending_task_copy) {
                 Self::sleep_until_task_is_ready(&pending_task_copy).await;
@@ -943,7 +943,11 @@ impl Scheduler {
                 let next_date = if let Some(last_execution_time) = task.last_execution_time {
                     // Bad input, assume no previous run
                     if current_date.timestamp() < last_execution_time.timestamp() {
-                        return current_date;
+                        return if !allow_now {
+                            current_date.add(TimeDelta::seconds(1))
+                        } else {
+                            current_date
+                        }
                     }
 
                     let last_execution_in_tz = last_execution_time
@@ -973,14 +977,14 @@ impl Scheduler {
                     );
                 }
 
-                if allow_now && next_date == current_date {
+                if !allow_now && next_date == current_date {
                     next_date.add(chrono::Duration::from_std(*interval).unwrap())
                 } else {
                     next_date
                 }
             }
             Schedule::When { time } => {
-                let mut curr = current_date;
+                let mut iter = current_date;
                 let mut limit = 365;
 
                 loop {
@@ -995,13 +999,13 @@ impl Scheduler {
                     }
                     limit -= 1;
 
-                    let curr_second = curr.second();
-                    let curr_minute = curr.minute();
-                    let curr_hour = curr.hour();
-                    let curr_day0 = curr.day0();
-                    let curr_month = curr.month();
-                    let curr_month0 = curr.month0();
-                    let curr_year = curr.year();
+                    let curr_second = iter.second();
+                    let curr_minute = iter.minute();
+                    let curr_hour = iter.hour();
+                    let curr_day0 = iter.day0();
+                    let curr_month = iter.month();
+                    let curr_month0 = iter.month0();
+                    let curr_year = iter.year();
 
                     // Try next second, minute, hour, etc.
                     let (second, t) = time.second.get_next_valid_value(curr_second, 60);
@@ -1012,32 +1016,34 @@ impl Scheduler {
                     let (month0, t) = time.month.get_next_valid_value(curr_month0 + t, 12);
                     let (year, _) = time.year.get_next_valid_value(curr_year as u32, 3000);
 
-                    let mut next_date = current_date
+                    let mut next_iter = current_date
                         .timezone()
                         .with_ymd_and_hms(year as i32, month0 + 1, day0 + 1, hour, minute, second)
                         .unwrap();
 
-                    next_date = next_date.with_nanosecond(0).unwrap_or(next_date);
+                    next_iter = next_iter.with_nanosecond(0).unwrap_or(next_iter);
 
-                    if next_date < curr {
+                    if next_iter < iter {
                         panic!(
                             "[when] Logic error in next date calculation: curr = {}, next = {}, next < curr",
-                            curr, next_date
+                            iter, next_iter
                         );
                     }
 
-                    if !allow_now && next_date == curr {
-                        curr = next_date.add(TimeDelta::seconds(1));
+                    iter = next_iter;
+
+                    if !allow_now && iter == current_date {
+                        iter = iter.add(TimeDelta::seconds(1));
                         continue;
                     }
 
                     // If the day of the week doesn't match, move to the next day
-                    if !time.day_of_week.matches_value(curr.weekday().num_days_from_monday()) {
-                        curr = next_date.add(TimeDelta::days(1));
+                    if !time.day_of_week.matches_value(iter.weekday().num_days_from_monday()) {
+                        iter = iter.add(TimeDelta::days(1));
                         continue;
                     }
 
-                    return next_date;
+                    return iter;
                 }
             }
         }

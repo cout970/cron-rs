@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::alerts::{Alert, EscapeStrategy};
 use log::{info, warn};
 
@@ -211,6 +212,7 @@ pub fn parse_system_crontab_file(content: &str, source: &str) -> Vec<TaskDefinit
     let mut current_shell: Option<String> = None;
     // None = not set, Some("") = explicitly cleared (no mail)
     let mut current_mailto: Option<String> = None;
+    let mut current_env: HashMap<String, String> = HashMap::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -247,11 +249,15 @@ pub fn parse_system_crontab_file(content: &str, source: &str) -> Vec<TaskDefinit
                             }
                             current_mailto = Some(value.to_string());
                         }
-                        other => {
-                            warn!(
-                                "cron-compat: {}: unsupported variable '{}={}', ignoring",
-                                source, other, value
-                            );
+                        _ => {
+                            current_env = current_env.clone();
+                            if value.is_empty() {
+                                current_env.remove(key);
+                                info!("cron-compat: {}: variable '{}' cleared", source, key);
+                            } else {
+                                current_env.insert(key.to_string(), value.to_string());
+                                info!("cron-compat: {}: variable '{}={}'", source, key, value);
+                            }
                         }
                     }
                     last_comment.clear();
@@ -365,52 +371,59 @@ fn make_when_pattern(
 /// Handles `*`, `*/n`, bare numbers, `n-m` ranges, and comma-separated combinations.
 /// When `is_dow` is true, value `7` is normalized to `0` (both mean Sunday in standard cron).
 pub fn map_cron_field(s: &str, is_dow: bool) -> ExplodedTimePatternFieldConfig {
-    // Standard cron uses `-` for ranges; cron-rs uses `..`
-    let text = s.replace('-', "..");
+    let text = s.to_string();
+    let mut result: Vec<String> = vec![];
 
-    if text.contains(',') {
-        let mut result: Vec<String> = vec![];
+    for opt in text.split(',').map(str::trim) {
+        if opt.contains("-") && !opt.starts_with("*/") {
+            // Expanded range: 1-5
+            let parts: Vec<&str> = opt.splitn(2, "-").collect();
 
-        for opt in text.split(',').map(str::trim) {
-            if opt.contains("..") && !opt.starts_with("*/") {
-                // Expanded range: 1..5
-                let parts: Vec<&str> = opt.splitn(2, "..").collect();
-                match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                    (Ok(start), Ok(end)) if start <= end => {
-                        for i in start..=end {
-                            result.push(if is_dow && i == 7 { "0".to_string() } else { i.to_string() });
+            if parts[1].contains('/') {
+                // Handle step values in ranges, e.g. 1-10/2, start at 1, end at 10, step by 2
+                let step_parts: Vec<&str> = parts[1].splitn(2, '/').collect();
+                if step_parts.len() == 2 {
+                    let end_part = step_parts[0];
+                    let step_part = step_parts[1];
+                    match (parts[0].parse::<u32>(), end_part.parse::<u32>(), step_part.parse::<u32>()) {
+                        (Ok(start), Ok(end), Ok(step)) => {
+                            if start <= end && step > 0 {
+                                let mut i = start;
+                                while i <= end {
+                                    result.push(if is_dow && i == 7 { "0".to_string() } else { i.to_string() });
+                                    i += step;
+                                }
+                                continue;
+                            }
                         }
-                    }
-                    _ => warn!("cron-compat: invalid range '{}', skipping", opt),
-                }
-            } else {
-                if is_dow {
-                    if let Ok(n) = opt.parse::<u32>() {
-                        result.push(if n == 7 { "0".to_string() } else { n.to_string() });
-                        continue;
+                        _ => warn!("cron-compat: invalid range with step '{}', skipping", opt),
                     }
                 }
-                result.push(opt.to_string());
             }
-        }
 
-        if result.len() == 1 {
-            ExplodedTimePatternFieldConfig::Text(result.into_iter().next().unwrap())
-        } else {
-            ExplodedTimePatternFieldConfig::Text(format!("[{}]", result.join(", ")))
-        }
-    } else {
-        // Single value — normalise DOW 7 → 0
-        let text = if is_dow {
-            if let Ok(n) = text.parse::<u32>() {
-                if n == 7 { "0".to_string() } else { text }
-            } else {
-                text
+            match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                (Ok(start), Ok(end)) if start <= end => {
+                    for i in start..=end {
+                        result.push(if is_dow && i == 7 { "0".to_string() } else { i.to_string() });
+                    }
+                }
+                _ => warn!("cron-compat: invalid range '{}', skipping", opt),
             }
         } else {
-            text
-        };
-        ExplodedTimePatternFieldConfig::Text(text)
+            if is_dow {
+                if let Ok(n) = opt.parse::<u32>() {
+                    result.push(if n == 7 { "0".to_string() } else { n.to_string() });
+                    continue;
+                }
+            }
+            result.push(opt.to_string());
+        }
+    }
+
+    if result.len() == 1 {
+        ExplodedTimePatternFieldConfig::Text(result.into_iter().next().unwrap())
+    } else {
+        ExplodedTimePatternFieldConfig::List(result)
     }
 }
 

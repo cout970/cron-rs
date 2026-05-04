@@ -212,7 +212,7 @@ fn template_replace(template: &str, details: &TaskExecutionDetails, escape: &Esc
 
     fn replace_and_escape(result: &mut String, placeholder: &str, value: &str, escape: &EscapeStrategy) {
         let start = "{{";
-        let end = "{{";
+        let end = "}}";
         let with_spaces = format!("{} {} {}", start, placeholder, end);
         if result.contains(&with_spaces) {
             let escaped_value = template_escape(value, escape);
