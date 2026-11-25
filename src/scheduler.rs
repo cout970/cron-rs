@@ -32,6 +32,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+/// Log messages emitted after a SIGHUP reload; `cron-rs reload` looks for them in the daemon logs.
+pub const RELOAD_OK_MSG: &str = "Configuration reloaded successfully";
+pub const RELOAD_FAILED_MSG: &str = "Failed to reload configuration";
+
 #[derive(Debug, Clone)]
 pub struct PendingTask {
     pub config: Arc<TaskConfig>,
@@ -337,7 +341,7 @@ impl Scheduler {
                         let mut scheduler = mutex.lock().await;
                         match scheduler.reload_config().await {
                             Ok(task_count) => {
-                                info!("Configuration reloaded successfully with {} tasks", task_count);
+                                info!("{} with {} tasks", RELOAD_OK_MSG, task_count);
 
                                 // Re-spawn task loops for the new tasks
                                 let pending_tasks = scheduler.pending_tasks.clone();
@@ -346,7 +350,7 @@ impl Scheduler {
                                 Self::spawn_tasks(mutex.clone(), pending_tasks).await;
                             }
                             Err(e) => {
-                                error!("Failed to reload configuration: {}. Keeping existing config.", e);
+                                error!("{}: {}. Keeping existing config.", RELOAD_FAILED_MSG, e);
                             }
                         }
                     }

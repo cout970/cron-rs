@@ -9,6 +9,8 @@ mod task_executor;
 mod watchdog;
 
 mod alerts;
+mod pid_file;
+mod reload;
 
 mod utils;
 
@@ -17,6 +19,8 @@ use crate::config::cron::parse_crontab_file;
 use crate::config::file::ConfigFile;
 use crate::config::loader::ConfigLoader;
 use crate::config::logging::LoggingConfig;
+use crate::pid_file::{PidFile, DEFAULT_PID_FILE};
+use crate::reload::ReloadOptions;
 use crate::schedule_display::ScheduleDisplay;
 use crate::scheduler::Scheduler;
 use crate::sqlite_logger::SqliteLogger;
@@ -43,6 +47,10 @@ struct Args {
     #[arg(long, global = true)]
     cron_compat: bool,
 
+    /// Path to the PID file written by `run` and read by `reload`
+    #[arg(long, global = true, default_value = DEFAULT_PID_FILE)]
+    pid_file: PathBuf,
+
     #[command(subcommand)]
     cmd: ArgCmd,
 }
@@ -51,6 +59,15 @@ struct Args {
 enum ArgCmd {
     /// Run the tasks defined in the config file
     Run,
+    /// Validate the config and tell the running scheduler (found via the PID file) to reload it
+    Reload {
+        /// Max seconds to wait for the scheduler's log output after reloading (0 to not wait)
+        #[arg(long, short, default_value_t = 2)]
+        wait: u64,
+        /// Send the reload signal even if the config file has errors
+        #[arg(long)]
+        force: bool,
+    },
     /// Validate the config file
     Validate {
         /// Path to the config file to validate
@@ -95,7 +112,32 @@ fn main() -> anyhow::Result<()> {
     match args.cmd {
         ArgCmd::Run => {
             let loader = ConfigLoader::new(get_config_path(args.config)?, cron_compat);
-            cmd_run(loader)?;
+            cmd_run(loader, &args.pid_file)?;
+        }
+        ArgCmd::Reload { wait, force } => {
+            let pid = pid_file::read_pid(&args.pid_file)?;
+            if !pid_file::is_cron_rs_process(pid) {
+                let name = pid_file::process_name(pid);
+                return Err(match name {
+                    Some(name) => anyhow!(
+                        "PID {} from {} belongs to '{}', not cron-rs (stale PID file?)",
+                        pid,
+                        args.pid_file.display(),
+                        name
+                    ),
+                    None => anyhow!(
+                        "No process with PID {} (from {}) is running. Is cron-rs running?",
+                        pid,
+                        args.pid_file.display()
+                    ),
+                });
+            }
+
+            let loader = daemon_config_loader(pid, args.config, cron_compat)?;
+            let opts = ReloadOptions { wait, force };
+            if !reload::cmd_reload(pid, &loader, &opts)? {
+                std::process::exit(1);
+            }
         }
         ArgCmd::Validate { path } => {
             let path = path.map(Ok).unwrap_or_else(|| get_config_path(args.config))?;
@@ -129,11 +171,20 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run(loader: ConfigLoader) -> anyhow::Result<()> {
+fn cmd_run(loader: ConfigLoader, pid_file: &PathBuf) -> anyhow::Result<()> {
     let config = loader.load()?;
     logging::setup_logging(&config.logging)?;
 
     info!("Starting cron-rs with config file: {}", loader.path.display());
+
+    // Removed on drop, when the scheduler exits
+    let _pid_file = match PidFile::create(pid_file) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            warn!("{:#}. `cron-rs reload` will not be able to find this process", e);
+            None
+        }
+    };
 
     Scheduler::new(config, loader).run();
 
@@ -325,4 +376,37 @@ fn get_config_path(mut config_path: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     }
 
     config_path.ok_or_else(|| anyhow!("No config file found. Please specify a config file with --config"))
+}
+
+/// Builds the loader for the config file used by the running scheduler `pid`.
+/// An explicit `--config` wins; otherwise the daemon's own command line (/proc/<pid>/cmdline)
+/// is inspected so we validate the same file it will reload.
+fn daemon_config_loader(pid: u32, cli_config: Option<PathBuf>, cli_cron_compat: bool) -> anyhow::Result<ConfigLoader> {
+    let daemon_args = std::fs::read(format!("/proc/{}/cmdline", pid))
+        .ok()
+        .and_then(|raw| {
+            let argv = raw
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).to_string());
+            Args::try_parse_from(argv).ok()
+        });
+
+    let daemon_cron_compat = daemon_args.as_ref().is_some_and(|a| a.cron_compat);
+    let daemon_config = daemon_args.and_then(|a| a.config).map(|path| {
+        if path.is_relative() {
+            match std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                Ok(cwd) => cwd.join(path),
+                Err(_) => path,
+            }
+        } else {
+            path
+        }
+    });
+
+    let path = match cli_config.or(daemon_config) {
+        Some(path) => path,
+        None => get_config_path(None)?,
+    };
+    Ok(ConfigLoader::new(path, cli_cron_compat || daemon_cron_compat))
 }

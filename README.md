@@ -59,6 +59,19 @@ cron-rs validate ./config.yml
 cron-rs generate-from-crontab > config.yml
 ```
 
+5. Reload the configuration of the running scheduler without restarting it:
+
+```bash
+sudo cron-rs reload
+```
+
+`run` writes its PID to `/run/cron-rs.pid` (change it with `--pid-file`). `reload` reads that PID,
+validates the config file the scheduler is using (taken from its `--config` argument, or the usual
+lookup), sends it `SIGHUP`, and then prints the scheduler's log lines for up to 2 seconds
+(`--wait <secs>`, `0` to skip). It reads them from the log file when `logging.output: file`,
+otherwise from journald. If the config has errors, nothing is sent unless you pass `--force`.
+The command exits with code 1 if the scheduler reports that the reload failed.
+
 ## Configuration File Locations
 
 The scheduler will look for configuration files in the following locations (in order):

@@ -9,6 +9,7 @@ After=network.target
 
 [Service]
 ExecStart=/bin/cron-rs run
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 WorkingDirectory=/tmp
