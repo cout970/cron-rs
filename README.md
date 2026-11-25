@@ -252,7 +252,7 @@ logging:
 logging:
   output: file
   level: debug
-  path: /var/log/cron-rs.log
+  file: /var/log/cron-rs.log
 
 # Log to syslog
 logging:

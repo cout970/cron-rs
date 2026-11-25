@@ -303,8 +303,9 @@ impl Scheduler {
         // Spawn task execution tasks
         Self::spawn_tasks(mutex.clone(), pending_tasks).await;
 
-        // Wait for Ctrl+C signal to stop the infinite loop
+        // Wait for Ctrl+C (SIGINT) or SIGTERM (e.g. `systemctl stop`) to stop the infinite loop
         let ctrl_c = signal::ctrl_c();
+        let mut sigterm = signal::unix::signal(SignalKind::terminate()).expect("Failed to register SIGTERM");
         let mut sigusr1 = signal::unix::signal(SignalKind::user_defined1()).expect("Failed to register SIGUSR1");
         let mut sighup = signal::unix::signal(SignalKind::hangup()).expect("Failed to register SIGHUP");
 
@@ -314,18 +315,13 @@ impl Scheduler {
         loop {
             tokio::select! {
                 _ = &mut ctrl_c => {
-                    info!("Scheduler shutdown initiated");
-                    {
-                        let mut scheduler = mutex.lock().await;
-                        scheduler.save_state().await;
-
-                        for handle in &scheduler.task_loop_handles {
-                            handle.abort();
-                        }
-                        for handle in &scheduler.wait_handles {
-                            handle.abort();
-                        }
-                    }
+                    info!("Received SIGINT, scheduler shutdown initiated");
+                    Self::shutdown(&mutex).await;
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, scheduler shutdown initiated");
+                    Self::shutdown(&mutex).await;
                     break;
                 }
                 _ = sigusr1.recv() => {
@@ -359,6 +355,19 @@ impl Scheduler {
         }
 
         Ok(())
+    }
+
+    /// Saves state and aborts all task loops and wait handles before exiting.
+    async fn shutdown(mutex: &Arc<Mutex<Scheduler>>) {
+        let mut scheduler = mutex.lock().await;
+        scheduler.save_state().await;
+
+        for handle in &scheduler.task_loop_handles {
+            handle.abort();
+        }
+        for handle in &scheduler.wait_handles {
+            handle.abort();
+        }
     }
 
     async fn spawn_tasks(mutex: Arc<Mutex<Scheduler>>, pending_tasks: Vec<Arc<Mutex<PendingTask>>>) {
