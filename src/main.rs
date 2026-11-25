@@ -4,6 +4,7 @@ mod config;
 mod logging;
 mod schedule_display;
 mod scheduler;
+mod supervisor;
 mod sqlite_logger;
 mod task_executor;
 mod watchdog;

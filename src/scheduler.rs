@@ -1,12 +1,13 @@
-use crate::alerts::{send_alert, Alert, AlertConfig, TaskExecutionDetails};
+use crate::alerts::{send_alerts, Alert, AlertConfig, TaskExecutionDetails};
 use crate::config::loader::ConfigLoader;
 use crate::config::watchdog::WatchdogConfig;
-use crate::config::{Config, Schedule, TaskConfig, TimePatternField};
+use crate::config::{Config, Schedule, TaskConfig, TimePattern, TimePatternField};
+use crate::supervisor;
 use crate::watchdog;
 use crate::sqlite_logger::{ExecutionAttempt, ExecutionFailure, ExecutionSuccess, SqliteLogger};
 use crate::utils::format_duration;
 use anyhow::anyhow;
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Timelike};
+use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeDelta, Timelike};
 use chrono::{TimeZone, Utc};
 use chrono_tz::Tz;
 use log::{debug, error, info, warn};
@@ -17,6 +18,7 @@ use std::fs::File;
 use std::io;
 use std::ops::{Add, Deref};
 use std::os::unix::prelude::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,7 +26,6 @@ use std::sync::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{Gid, Groups, ProcessStatus, User, Users};
-use sysinfo::{Pid, System};
 use tokio::process::{Child, Command};
 use tokio::signal;
 use tokio::signal::unix::SignalKind;
@@ -374,9 +375,12 @@ impl Scheduler {
         for pending_task_mutex in pending_tasks {
             let scheduler_mutex = mutex.clone();
 
-            let handle = tokio::spawn(async move {
-                Self::execute_task_loop(pending_task_mutex, scheduler_mutex).await;
-            });
+            let name = format!("Task loop of '{}'", pending_task_mutex.lock().await.config.name);
+
+            // Supervised: if the loop panics it is restarted instead of silently stopping the task
+            let handle = tokio::spawn(supervisor::supervise_default(name, move || {
+                Self::execute_task_loop(pending_task_mutex.clone(), scheduler_mutex.clone())
+            }));
 
             {
                 let mut scheduler = mutex.lock().await;
@@ -432,6 +436,9 @@ impl Scheduler {
                     Ok(active_task) => active_task,
                     Err(e) => {
                         error!("{}", e);
+                        // Count it as an execution, otherwise the task is still "ready" and the
+                        // loop retries immediately, in a busy loop
+                        pending_task_mutex.lock().await.last_execution_time = Some(Utc::now());
                         continue;
                     }
                 };
@@ -456,14 +463,7 @@ impl Scheduler {
             if start.elapsed().as_secs() < 1 {
                 // Sleeping a whole second makes the time drifts slowly, by sleeping only the
                 // millis needed to jump to the next second, we mostly eliminate the drift
-                let next_second =
-                    Self::get_current_datetime_at(pending_task_copy.config.timezone) + TimeDelta::seconds(1);
-                let current_second = Self::get_precise_datetime_at(pending_task_copy.config.timezone);
-
-                // Get the number of milliseconds to the next second
-                let diff = next_second.signed_duration_since(current_second).num_milliseconds() as u64;
-
-                sleep(Duration::from_millis(diff)).await;
+                sleep(Self::duration_to_next_second(Utc::now())).await;
             }
         }
     }
@@ -472,11 +472,10 @@ impl Scheduler {
     async fn wait_for_task(mutex: Arc<Mutex<Scheduler>>, task_id: u32) {
         let (child_mutex, time_limit, task_name) = {
             let scheduler = mutex.lock().await;
-            let active_task = scheduler
-                .active_tasks
-                .iter()
-                .find(|t| t.id == task_id)
-                .expect("Task not found");
+            let Some(active_task) = scheduler.active_tasks.iter().find(|t| t.id == task_id) else {
+                error!("Active task {} not found", task_id);
+                return;
+            };
             (
                 active_task.child.clone(),
                 active_task.time_limit.clone(),
@@ -489,42 +488,51 @@ impl Scheduler {
         let handle = tokio::spawn(async move {
             let mut child = child_mutex.lock().await;
 
-            let exit_status = if let Some(time_limit) = time_limit {
+            let wait_result = if let Some(time_limit) = time_limit {
                 tokio::select! {
-                    status = child.wait() => {
-                        status.expect("Failed to wait for task")
-                    }
+                    status = child.wait() => status,
                     _ = sleep(Duration::from_secs(time_limit)) => {
                         // Warn the user that the task will be killed
                         warn!("Task '{}' exceeded time limit of {} seconds, sending SIGKILL", task_name, time_limit);
 
-                        child.kill().await.expect("Unable to kill process");
+                        if let Err(e) = child.kill().await {
+                            error!("Unable to kill task '{}': {}", task_name, e);
+                        }
                         // We still need to wait for the process to fully terminate
-                        child.wait().await.expect("Failed to wait for task")
+                        child.wait().await
                     }
                 }
             } else {
-                child.wait().await.expect("Failed to wait for task")
+                child.wait().await
+            };
+            drop(child);
+
+            // Never panic before removing the task from active_tasks, otherwise a task with
+            // avoid_overlapping would be considered running forever
+            let exit_status = wait_result.unwrap_or_else(|e| {
+                error!("Failed to wait for task '{}': {}", task_name, e);
+                ExitStatus::from_raw(255 << 8)
+            });
+
+            // Remove the active task, keep the lock only for that: the completion handlers
+            // (alerts, sqlite, reading output files) can be slow
+            let (active_task, config, sqlite_logger) = {
+                let mut scheduler = scheduler_mutex.lock().await;
+                let Some(index) = scheduler.active_tasks.iter().position(|t| t.id == task_id) else {
+                    error!("Active task {} ('{}') not found", task_id, task_name);
+                    return;
+                };
+                let active_task = scheduler.active_tasks.remove(index);
+                (active_task, scheduler.config.clone(), scheduler.sqlite_logger.clone())
             };
 
-            {
-                let mut scheduler = scheduler_mutex.lock().await;
-                // Remove active task
-                let active_task_index = scheduler
-                    .active_tasks
-                    .iter()
-                    .position(|t| t.id == task_id)
-                    .expect("Task not found");
-
-                let mut active_task = scheduler.active_tasks.remove(active_task_index);
-
-                let sqlite_logger = scheduler.sqlite_logger.clone();
-                Self::on_task_completed(&active_task, exit_status, &scheduler.config, &sqlite_logger).await;
-            }
+            Self::on_task_completed(&active_task, exit_status, &config, &sqlite_logger).await;
         });
 
         {
             let mut scheduler = mutex.lock().await;
+            // Finished handles keep their task allocation alive until dropped, clean them up
+            scheduler.wait_handles.retain(|h| !h.is_finished());
             scheduler.wait_handles.push(handle);
         }
     }
@@ -588,15 +596,19 @@ impl Scheduler {
         next_scheduled_run.timestamp() <= now.timestamp()
     }
 
-    /// Checks if the task is running
-    fn is_task_running<T: AsRef<str>>(task: &PendingTask, active_tasks: &[T]) -> bool {
-        if let Some(pid) = task.last_pid {
-            let sys = System::new_all();
-            if sys.process(Pid::from_u32(pid)).is_some() {
-                return true;
-            }
-        }
+    /// Time until the next whole second, always between 1 ms and 1 s.
+    /// Computed from a single clock reading: two readings could be apart by more than a second
+    /// (clock step, VM pause) and give a negative value, which used to become a sleep of ~584 million years
+    fn duration_to_next_second(now: DateTime<Utc>) -> Duration {
+        let millis = now.timestamp_subsec_millis() as u64; // can be >= 1000 during a leap second
+        Duration::from_millis(1000u64.saturating_sub(millis).clamp(1, 1000))
+    }
 
+    /// Checks if the task is running.
+    /// `active_tasks` is the source of truth: tasks are removed from it when their process ends.
+    /// (Checking `last_pid` against the running processes is wrong once the kernel reuses the PID,
+    /// the task would be considered running forever)
+    fn is_task_running<T: AsRef<str>>(task: &PendingTask, active_tasks: &[T]) -> bool {
         active_tasks.iter().any(|name| name.as_ref() == task.config.name)
     }
 
@@ -627,24 +639,24 @@ impl Scheduler {
 
         if let Some(path) = stdout_path.parent() {
             if !path.exists() {
-                tokio::fs::create_dir_all(path).await.expect(
-                    format!(
-                        "Failed to create stdout parent directory for task '{}'",
-                        task_config.name
+                tokio::fs::create_dir_all(path).await.map_err(|e| {
+                    anyhow!(
+                        "Failed to create stdout parent directory for task '{}': {}",
+                        task_config.name,
+                        e
                     )
-                    .as_str(),
-                );
+                })?;
             }
         }
         if let Some(path) = stderr_path.parent() {
             if !path.exists() {
-                tokio::fs::create_dir_all(path).await.expect(
-                    format!(
-                        "Failed to create stderr parent directory for task '{}'",
-                        task_config.name
+                tokio::fs::create_dir_all(path).await.map_err(|e| {
+                    anyhow!(
+                        "Failed to create stderr parent directory for task '{}': {}",
+                        task_config.name,
+                        e
                     )
-                    .as_str(),
-                );
+                })?;
             }
         }
 
@@ -867,19 +879,7 @@ impl Scheduler {
         task_on_failure: &[Alert],
         sqlite_logger: &Option<SqliteLogger>,
     ) {
-        for alert in &alerts.on_failure {
-            if let Err(e) = send_alert(alert, details) {
-                error!("Failed to send alert for task '{}': {}", details.task_name, e);
-            }
-        }
-        for alert in task_on_failure {
-            if let Err(e) = send_alert(alert, details) {
-                error!(
-                    "Failed to send task-specific alert for task '{}': {}",
-                    details.task_name, e
-                );
-            }
-        }
+        send_alerts(alerts.on_failure.iter().chain(task_on_failure), details).await;
 
         if let Some(sqlite_logger) = sqlite_logger {
             let failure = ExecutionFailure {
@@ -914,19 +914,7 @@ impl Scheduler {
         task_on_success: &[Alert],
         sqlite_logger: &Option<SqliteLogger>,
     ) {
-        for alert in &alerts.on_success {
-            if let Err(e) = send_alert(alert, details) {
-                error!("Failed to send alert for task '{}': {}", details.task_name, e);
-            }
-        }
-        for alert in task_on_success {
-            if let Err(e) = send_alert(alert, details) {
-                error!(
-                    "Failed to send task-specific alert for task '{}': {}",
-                    details.task_name, e
-                );
-            }
-        }
+        send_alerts(alerts.on_success.iter().chain(task_on_success), details).await;
 
         if let Some(sqlite_logger) = sqlite_logger {
             let success = ExecutionSuccess {
@@ -950,114 +938,199 @@ impl Scheduler {
 
     /// Calculate the next date and time for the task to run
     /// current_date: must be rounded to the second, use Self::get_current_datetime_at(timezone) to get it
+    ///
+    /// This function must never panic: it runs inside the task loops and `save_state`, a panic there
+    /// would silently stop the task (or the whole scheduler).
     pub fn get_next_execution_time(task: &PendingTask, current_date: DateTime<Tz>, allow_now: bool) -> DateTime<Tz> {
         match &task.config.schedule {
             Schedule::Every { interval, aligned } => {
-                let next_date = if let Some(last_execution_time) = task.last_execution_time {
-                    // Bad input, assume no previous run
-                    if current_date.timestamp() < last_execution_time.timestamp() {
-                        return if !allow_now {
-                            current_date.add(TimeDelta::seconds(1))
-                        } else {
-                            current_date
-                        }
-                    }
+                Self::get_next_every_execution_time(task, *interval, *aligned, current_date, allow_now)
+            }
+            Schedule::When { time } => Self::get_next_when_execution_time(task, time, current_date, allow_now),
+        }
+    }
 
-                    let last_execution_in_tz = last_execution_time
-                        .with_timezone(&task.config.timezone)
-                        .with_nanosecond(0)
-                        .unwrap();
+    fn get_next_every_execution_time(
+        task: &PendingTask,
+        interval: Duration,
+        aligned: bool,
+        current_date: DateTime<Tz>,
+        allow_now: bool,
+    ) -> DateTime<Tz> {
+        let tz = current_date.timezone();
+        let tick = (interval.as_secs() as i64).max(1);
+        let at = |ts: i64| tz.timestamp_opt(ts, 0).single().unwrap_or(current_date);
+        // First point of the interval grid strictly after `ts`
+        let grid_after = |ts: i64| at((ts.div_euclid(tick) + 1) * tick);
+        let now_ts = current_date.timestamp();
 
-                    if *aligned {
-                        // Make the next run aligned to the interval length
-                        let tick_len = interval.as_secs() as i64;
-                        let current_date_after_interval = ((current_date.timestamp() + tick_len) / tick_len) * tick_len;
-                        let diff = current_date_after_interval - current_date.timestamp();
+        let Some(last_execution_time) = task.last_execution_time else {
+            // First run
+            return if allow_now { current_date } else if aligned { grid_after(now_ts) } else { at(now_ts + tick) };
+        };
+        let last_ts = last_execution_time.timestamp();
 
-                        last_execution_in_tz + chrono::Duration::seconds(diff)
+        // Clock went backwards (or bad input), assume no previous run
+        if now_ts < last_ts {
+            return if allow_now { current_date } else { at(now_ts + 1) };
+        }
+
+        let next_date = if aligned { grid_after(last_ts) } else { at(last_ts + tick) };
+
+        // The execution is overdue (the process was suspended, the clock jumped, the loop was delayed...),
+        // run it as soon as possible instead of trying to catch up with every missed run
+        let next_date = next_date.max(current_date);
+
+        if !allow_now && next_date == current_date {
+            if aligned { grid_after(now_ts) } else { at(now_ts + tick) }
+        } else {
+            next_date
+        }
+    }
+
+    fn get_next_when_execution_time(
+        task: &PendingTask,
+        time: &TimePattern,
+        current_date: DateTime<Tz>,
+        allow_now: bool,
+    ) -> DateTime<Tz> {
+        let tz = current_date.timezone();
+        // Returned when no valid date is found, re-evaluate later instead of running right now
+        let fallback = current_date + TimeDelta::days(1);
+        let hourly = matches!(time.hour, TimePatternField::Any);
+        let mut from = if allow_now { current_date } else { current_date + TimeDelta::seconds(1) };
+
+        // Only DST transitions need more than one iteration
+        for _ in 0..8 {
+            let Some(naive) = Self::get_next_matching_local_time(time, from.naive_local()) else {
+                error!("Task '{}' has no valid next execution time", task.config.name);
+                return fallback;
+            };
+
+            let next = match tz.from_local_datetime(&naive) {
+                LocalResult::Single(dt) => dt,
+                // Fall back DST transition, this local time happens twice
+                LocalResult::Ambiguous(first, second) => {
+                    if first >= from {
+                        first
+                    } else if hourly {
+                        // Tasks that run every hour also run during the repeated hour
+                        second
                     } else {
-                        last_execution_in_tz + chrono::Duration::from_std(*interval).unwrap()
+                        // Tasks with a fixed hour already ran in the first occurrence, skip the repeated one
+                        from = second.max(from) + TimeDelta::seconds(1);
+                        continue;
                     }
-                } else {
-                    // First run
-                    current_date
-                };
-
-                if next_date < current_date {
-                    panic!(
-                        "[every] Logic error in next date calculation: curr = {}, next = {}, next < curr",
-                        current_date, next_date
-                    );
                 }
+                // Spring forward DST transition, this local time doesn't exist
+                LocalResult::None => Self::resolve_local_time(tz, naive),
+            };
 
-                if !allow_now && next_date == current_date {
-                    next_date.add(chrono::Duration::from_std(*interval).unwrap())
-                } else {
-                    next_date
+            // Searching by local time from the first occurrence of the repeated hour jumps straight past
+            // the second occurrence, tasks that run every hour must also run during it
+            if hourly {
+                if let Some(repeated_start) = Self::get_repeated_hour_start(tz, from) {
+                    if next >= repeated_start && repeated_start > from {
+                        from = repeated_start;
+                        continue;
+                    }
                 }
             }
-            Schedule::When { time } => {
-                let mut iter = current_date;
-                let mut limit = 365;
 
-                loop {
-                    // Iteration limit to avoid infinite loops
-                    if limit <= 0 {
-                        error!("Task '{}' has no valid next execution time", task.config.name);
-                        return if allow_now {
-                            current_date
-                        } else {
-                            current_date.add(TimeDelta::seconds(1))
-                        };
-                    }
-                    limit -= 1;
+            if next < from {
+                error!(
+                    "Task '{}' has no valid next execution time (curr = {}, next = {})",
+                    task.config.name, from, next
+                );
+                return fallback;
+            }
+            return next;
+        }
 
-                    let curr_second = iter.second();
-                    let curr_minute = iter.minute();
-                    let curr_hour = iter.hour();
-                    let curr_day0 = iter.day0();
-                    let curr_month = iter.month();
-                    let curr_month0 = iter.month0();
-                    let curr_year = iter.year();
+        error!("Task '{}' has no valid next execution time", task.config.name);
+        fallback
+    }
 
-                    // Try next second, minute, hour, etc.
-                    let (second, t) = time.second.get_next_valid_value(curr_second, 60);
-                    let (minute, t) = time.minute.get_next_valid_value(curr_minute + t, 60);
-                    let (hour, t) = time.hour.get_next_valid_value(curr_hour + t, 24);
-                    let days_in_month = Self::get_num_of_days_in_month(curr_month, curr_year);
-                    let (day0, t) = time.day.get_next_valid_value(curr_day0 + t, days_in_month);
-                    let (month0, t) = time.month.get_next_valid_value(curr_month0 + t, 12);
-                    let (year, _) = time.year.get_next_valid_value(curr_year as u32, 3000);
+    /// Finds the first local time >= `start` (truncated to the second) that matches the pattern.
+    /// Advances one field at a time, resetting the smaller fields, e.g. for '05:*:00' at 10:30
+    /// the result is 05:00 the next day, not 05:30.
+    fn get_next_matching_local_time(time: &TimePattern, start: NaiveDateTime) -> Option<NaiveDateTime> {
+        let midnight = |date: NaiveDate| date.and_hms_opt(0, 0, 0);
+        let mut t = start.with_nanosecond(0)?;
 
-                    let mut next_iter = current_date
-                        .timezone()
-                        .with_ymd_and_hms(year as i32, month0 + 1, day0 + 1, hour, minute, second)
-                        .unwrap();
+        // Enough to cover centuries of day by day steps, impossible patterns (Feb 30th) end here
+        for _ in 0..500_000 {
+            let date = t.date();
+            if date.year() > 3000 {
+                return None;
+            }
 
-                    next_iter = next_iter.with_nanosecond(0).unwrap_or(next_iter);
+            if !time.year.matches_value(date.year().max(0) as u32) {
+                t = midnight(NaiveDate::from_ymd_opt(date.year() + 1, 1, 1)?)?;
+                continue;
+            }
+            if !time.month.matches_one_based(date.month()) {
+                let (y, m) = if date.month() == 12 { (date.year() + 1, 1) } else { (date.year(), date.month() + 1) };
+                t = midnight(NaiveDate::from_ymd_opt(y, m, 1)?)?;
+                continue;
+            }
+            if !time.matches_date(date) {
+                t = midnight(date.succ_opt()?)?;
+                continue;
+            }
+            if !time.hour.matches_value(t.hour()) {
+                t = date.and_hms_opt(t.hour(), 0, 0)? + TimeDelta::hours(1);
+                continue;
+            }
+            if !time.minute.matches_value(t.minute()) {
+                t = date.and_hms_opt(t.hour(), t.minute(), 0)? + TimeDelta::minutes(1);
+                continue;
+            }
+            if !time.second.matches_value(t.second()) {
+                t += TimeDelta::seconds(1);
+                continue;
+            }
+            return Some(t);
+        }
+        None
+    }
 
-                    if next_iter < iter {
-                        panic!(
-                            "[when] Logic error in next date calculation: curr = {}, next = {}, next < curr",
-                            iter, next_iter
-                        );
-                    }
+    /// If `dt` is in the first occurrence of a local time that happens twice (fall back DST transition),
+    /// returns the instant where the repeated local time range starts again (the transition instant)
+    fn get_repeated_hour_start(tz: Tz, dt: DateTime<Tz>) -> Option<DateTime<Tz>> {
+        let local = dt.naive_local();
+        let LocalResult::Ambiguous(first, _) = tz.from_local_datetime(&local) else {
+            return None;
+        };
+        if first != dt {
+            return None;
+        }
 
-                    iter = next_iter;
+        // Find the start of the ambiguous range, transitions happen at minute boundaries
+        let mut start = local.with_second(0)?.with_nanosecond(0)?;
+        for _ in 0..(24 * 60) {
+            let prev = start - TimeDelta::minutes(1);
+            if !matches!(tz.from_local_datetime(&prev), LocalResult::Ambiguous(..)) {
+                break;
+            }
+            start = prev;
+        }
+        tz.from_local_datetime(&start).latest()
+    }
 
-                    if !allow_now && iter == current_date {
-                        iter = iter.add(TimeDelta::seconds(1));
-                        continue;
-                    }
-
-                    // If the day of the week doesn't match, move to the next day
-                    if !time.day_of_week.matches_value(iter.weekday().num_days_from_monday()) {
-                        iter = iter.add(TimeDelta::days(1));
-                        continue;
-                    }
-
-                    return iter;
-                }
+    /// Converts a local time to an instant, never fails:
+    /// - Ambiguous times (fall back DST transition) resolve to the first occurrence
+    /// - Non-existent times (spring forward DST transition) are shifted forward by the length of the gap,
+    ///   e.g. 02:30 becomes 03:30 when the clock jumps from 02:00 to 03:00
+    fn resolve_local_time(tz: Tz, naive: NaiveDateTime) -> DateTime<Tz> {
+        match tz.from_local_datetime(&naive) {
+            LocalResult::Single(dt) => dt,
+            LocalResult::Ambiguous(first, _) => first,
+            LocalResult::None => {
+                // Use the offset in effect before the gap (transitions are months apart)
+                let offset = tz.offset_from_utc_datetime(&(naive - TimeDelta::days(1))).fix();
+                let utc = naive - TimeDelta::seconds(offset.local_minus_utc() as i64);
+                tz.from_utc_datetime(&utc)
             }
         }
     }
@@ -1095,24 +1168,6 @@ impl Scheduler {
             group_str.to_string(),
         ))
     }
-
-    /// Get the number of days in a month, taking into account leap years, the month value is 1-based
-    fn get_num_of_days_in_month(mut month: u32, mut year: i32) -> u32 {
-        // Wrap value if needed
-        if month > 12 {
-            month -= 12;
-            year += 1;
-        }
-        let start_of_this_month = NaiveDate::from_ymd_opt(year, month, 1).expect("Invalid date");
-        let start_of_next_month = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1).expect("Invalid date")
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1).expect("Invalid date")
-        };
-        start_of_next_month
-            .signed_duration_since(start_of_this_month)
-            .num_days() as u32
-    }
 }
 
 impl PendingTask {
@@ -1123,5 +1178,321 @@ impl PendingTask {
             last_pid: None,
             retries: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::shorthand::parse_shorthand;
+
+    fn task(schedule: Schedule, tz: Tz) -> PendingTask {
+        PendingTask::new(Arc::new(TaskConfig {
+            name: "t".into(),
+            cmd: "true".into(),
+            schedule,
+            timezone: tz,
+            avoid_overlapping: false,
+            run_as: None,
+            time_limit: None,
+            working_directory: None,
+            env: None,
+            shell: None,
+            stdout: None,
+            stderr: None,
+            on_failure: vec![],
+            on_success: vec![],
+        }))
+    }
+
+    fn when(pattern: &str, tz: &str) -> PendingTask {
+        task(
+            Schedule::When { time: parse_shorthand(pattern).unwrap() },
+            tz.parse().unwrap(),
+        )
+    }
+
+    fn every(secs: u64, aligned: bool) -> PendingTask {
+        task(
+            Schedule::Every { interval: Duration::from_secs(secs), aligned },
+            Tz::UTC,
+        )
+    }
+
+    fn madrid() -> Tz {
+        "Europe/Madrid".parse().unwrap()
+    }
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, min, s).unwrap()
+    }
+
+    fn next(t: &PendingTask, now: DateTime<Tz>, allow_now: bool) -> DateTime<Utc> {
+        Scheduler::get_next_execution_time(t, now, allow_now).with_timezone(&Utc)
+    }
+
+    // ── DST: spring forward (Europe/Madrid 2026-03-29, 02:00 CET -> 03:00 CEST) ──
+
+    #[test]
+    fn when_every_minute_across_spring_forward_gap() {
+        let t = when("* *-*-* *:*:0", "Europe/Madrid");
+        // 01:59:30 CET = 00:59:30 UTC. 02:00 local does not exist, next valid instant is 03:00 CEST
+        let now = madrid().with_ymd_and_hms(2026, 3, 29, 1, 59, 30).unwrap();
+        assert_eq!(next(&t, now, false), utc(2026, 3, 29, 1, 0, 0));
+    }
+
+    #[test]
+    fn when_daily_inside_spring_forward_gap_runs_after_the_gap() {
+        let t = when("* *-*-* 02:30:00", "Europe/Madrid");
+        let now = madrid().with_ymd_and_hms(2026, 3, 29, 1, 0, 0).unwrap();
+        // 02:30 does not exist that day; shifted by the gap length -> 03:30 CEST = 01:30 UTC
+        assert_eq!(next(&t, now, false), utc(2026, 3, 29, 1, 30, 0));
+    }
+
+    // ── DST: fall back (Europe/Madrid 2026-10-25, 03:00 CEST -> 02:00 CET) ──
+
+    #[test]
+    fn when_every_minute_enters_ambiguous_hour() {
+        let t = when("* *-*-* *:*:0", "Europe/Madrid");
+        let now = madrid().with_ymd_and_hms(2026, 10, 25, 1, 59, 30).unwrap();
+        // First occurrence of 02:00 (CEST) = 00:00 UTC
+        assert_eq!(next(&t, now, false), utc(2026, 10, 25, 0, 0, 0));
+    }
+
+    #[test]
+    fn when_every_minute_keeps_running_during_repeated_hour() {
+        let t = when("* *-*-* *:*:0", "Europe/Madrid");
+        // 02:59:30 CEST = 00:59:30 UTC, the next minute is 02:00 CET = 01:00 UTC
+        let now = utc(2026, 10, 25, 0, 59, 30).with_timezone(&madrid());
+        assert_eq!(next(&t, now, false), utc(2026, 10, 25, 1, 0, 0));
+        // Inside the repeated hour: 02:10:30 CET = 01:10:30 UTC
+        let now = utc(2026, 10, 25, 1, 10, 30).with_timezone(&madrid());
+        assert_eq!(next(&t, now, false), utc(2026, 10, 25, 1, 11, 0));
+    }
+
+    #[test]
+    fn when_daily_in_ambiguous_hour_runs_only_once() {
+        let t = when("* *-*-* 02:30:00", "Europe/Madrid");
+        let now = madrid().with_ymd_and_hms(2026, 10, 25, 1, 0, 0).unwrap();
+        // First occurrence: 02:30 CEST = 00:30 UTC
+        assert_eq!(next(&t, now, false), utc(2026, 10, 25, 0, 30, 0));
+        // Right after running, the repeated 02:30 CET must be skipped -> next day 02:30 CET
+        let now = utc(2026, 10, 25, 0, 30, 1).with_timezone(&madrid());
+        assert_eq!(next(&t, now, false), utc(2026, 10, 26, 1, 30, 0));
+    }
+
+    #[test]
+    fn when_hourly_runs_in_both_repeated_hours() {
+        let t = when("* *-*-* *:30:00", "Europe/Madrid");
+        let now = utc(2026, 10, 25, 0, 30, 1).with_timezone(&madrid());
+        // 02:30 CEST already ran, 02:30 CET is a different hour and must run
+        assert_eq!(next(&t, now, false), utc(2026, 10, 25, 1, 30, 0));
+    }
+
+    // ── Year / month boundaries ──
+
+    #[test]
+    fn when_every_minute_across_new_year() {
+        let t = when("* *-*-* *:*:0", "UTC");
+        let now = Tz::UTC.with_ymd_and_hms(2026, 12, 31, 23, 59, 30).unwrap();
+        assert_eq!(next(&t, now, false), utc(2027, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn when_day_that_does_not_exist_in_next_month() {
+        // From Jan 31st, February has no 31st, the next one is in March
+        let t = when("* *-*-31 10:00:00", "UTC");
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 31, 12, 0, 0).unwrap();
+        assert_eq!(next(&t, now, false), utc(2026, 3, 31, 10, 0, 0));
+    }
+
+    #[test]
+    fn when_impossible_date_does_not_run_now() {
+        // February 30th never exists
+        let t = when("* *-02-30 10:00:00", "UTC");
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        assert!(next(&t, now, true) > now.with_timezone(&Utc));
+    }
+
+    // ── every ──
+
+    #[test]
+    fn every_aligned_next_grid_point() {
+        let mut t = every(60, true);
+        t.last_execution_time = Some(utc(2026, 1, 1, 10, 0, 0));
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 10, 0, 1).unwrap();
+        assert_eq!(next(&t, now, true), utc(2026, 1, 1, 10, 1, 0));
+    }
+
+    #[test]
+    fn every_aligned_overdue_does_not_panic() {
+        let mut t = every(60, true);
+        t.last_execution_time = Some(utc(2026, 1, 1, 10, 0, 0));
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 10, 1, 30).unwrap();
+        // Overdue: run now
+        assert_eq!(next(&t, now, true), utc(2026, 1, 1, 10, 1, 30));
+        // Not allowed to run now: next grid point
+        assert_eq!(next(&t, now, false), utc(2026, 1, 1, 10, 2, 0));
+    }
+
+    #[test]
+    fn every_not_aligned_overdue_does_not_panic() {
+        let mut t = every(60, false);
+        t.last_execution_time = Some(utc(2026, 1, 1, 10, 0, 0));
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 10, 5, 0).unwrap();
+        assert_eq!(next(&t, now, true), utc(2026, 1, 1, 10, 5, 0));
+        assert_eq!(next(&t, now, false), utc(2026, 1, 1, 10, 6, 0));
+    }
+
+    #[test]
+    fn every_not_aligned_regular() {
+        let mut t = every(60, false);
+        t.last_execution_time = Some(utc(2026, 1, 1, 10, 0, 0));
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 10, 0, 20).unwrap();
+        assert_eq!(next(&t, now, true), utc(2026, 1, 1, 10, 1, 0));
+    }
+
+
+    /// Simulates consecutive executions between two instants, checking that time always moves forward
+    fn simulate(t: &mut PendingTask, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+        let tz = t.config.timezone;
+        let mut runs = vec![];
+        let mut now = from.with_timezone(&tz);
+        loop {
+            let run = Scheduler::get_next_execution_time(t, now, runs.is_empty()).with_timezone(&Utc);
+            if run >= to {
+                return runs;
+            }
+            if let Some(prev) = runs.last() {
+                assert!(run > *prev, "time went backwards: {} -> {}", prev, run);
+            }
+            runs.push(run);
+            t.last_execution_time = Some(run);
+            now = run.with_timezone(&tz);
+        }
+    }
+
+    #[test]
+    fn simulate_dst_days_every_minute() {
+        // Local days in Europe/Madrid: spring forward has 23h, fall back has 25h
+        let mut t = when("* *-*-* *:*:0", "Europe/Madrid");
+        let runs = simulate(&mut t, utc(2026, 3, 28, 23, 0, 0), utc(2026, 3, 29, 22, 0, 0));
+        assert_eq!(runs.len(), 23 * 60);
+        let runs = simulate(&mut t, utc(2026, 10, 24, 22, 0, 0), utc(2026, 10, 25, 23, 0, 0));
+        assert_eq!(runs.len(), 25 * 60);
+    }
+
+    #[test]
+    fn simulate_dst_days_daily_at_ambiguous_or_missing_time() {
+        let mut t = when("* *-*-* 02:30:00", "Europe/Madrid");
+        // One run per local day, including the DST days
+        let runs = simulate(&mut t, utc(2026, 3, 27, 23, 0, 0), utc(2026, 3, 30, 22, 0, 0));
+        assert_eq!(runs.len(), 3, "{:?}", runs);
+        let runs = simulate(&mut t, utc(2026, 10, 23, 22, 0, 0), utc(2026, 10, 26, 23, 0, 0));
+        assert_eq!(runs.len(), 3, "{:?}", runs);
+    }
+
+    #[test]
+    fn simulate_new_year_and_leap_day() {
+        let mut t = when("* *-*-* *:0:0", "UTC");
+        let runs = simulate(&mut t, utc(2026, 12, 31, 20, 0, 0), utc(2027, 1, 1, 4, 0, 0));
+        assert_eq!(runs.len(), 8);
+        let runs = simulate(&mut t, utc(2028, 2, 28, 0, 0, 0), utc(2028, 3, 2, 0, 0, 0));
+        assert_eq!(runs.len(), 3 * 24);
+    }
+
+    #[test]
+    fn simulate_every_aligned() {
+        let mut t = every(300, true);
+        let runs = simulate(&mut t, utc(2026, 1, 1, 10, 2, 0), utc(2026, 1, 1, 11, 0, 0));
+        // First run immediately, then aligned to 5 minute boundaries
+        assert_eq!(runs[0], utc(2026, 1, 1, 10, 2, 0));
+        assert_eq!(runs[1], utc(2026, 1, 1, 10, 5, 0));
+        assert!(runs[1..].iter().all(|r| r.timestamp() % 300 == 0));
+        assert_eq!(runs.len(), 12);
+    }
+
+    // ── Field semantics: day and month are 1-based, day of week follows cron (Sun = 0) ──
+
+    #[test]
+    fn when_day_and_month_are_one_based() {
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        // /etc/cron.monthly pattern used by --cron-compat
+        assert_eq!(next(&when("* *-*-1 06:52:00", "UTC"), now, false), utc(2026, 1, 1, 6, 52, 0));
+        assert_eq!(next(&when("* *-02-* 10:00:00", "UTC"), now, false), utc(2026, 2, 1, 10, 0, 0));
+        assert_eq!(next(&when("* *-12-31 10:00:00", "UTC"), now, false), utc(2026, 12, 31, 10, 0, 0));
+        assert_eq!(next(&when("* *-*-01..04 12:00:00", "UTC"), now, false), utc(2026, 1, 1, 12, 0, 0));
+    }
+
+    #[test]
+    fn when_day_of_week() {
+        // 2026-01-01 is a Thursday
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        assert_eq!(next(&when("Mon *-*-* 00:00:00", "UTC"), now, false), utc(2026, 1, 5, 0, 0, 0));
+        assert_eq!(next(&when("Sun *-*-* 00:00:00", "UTC"), now, false), utc(2026, 1, 4, 0, 0, 0));
+        assert_eq!(next(&when("[Mon,Fri] *-*-* 00:00:00", "UTC"), now, false), utc(2026, 1, 2, 0, 0, 0));
+        // Numeric, cron style: 0 and 7 are Sunday
+        assert_eq!(next(&when("7 *-*-* 00:00:00", "UTC"), now, false), utc(2026, 1, 4, 0, 0, 0));
+        // Friday 13th
+        assert_eq!(next(&when("Fri *-*-13 09:00:00", "UTC"), now, false), utc(2026, 2, 13, 9, 0, 0));
+    }
+
+    #[test]
+    fn when_ratios() {
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 10, 2, 0).unwrap();
+        // Documented: '*/5+1' -> 1, 6, 11, ...
+        assert_eq!(next(&when("* *-*-* *:*/5+1:00", "UTC"), now, false), utc(2026, 1, 1, 10, 6, 0));
+        assert_eq!(next(&when("* *-*-* *:*/5:00", "UTC"), now, false), utc(2026, 1, 1, 10, 5, 0));
+        // Documented: months '*/2' -> January, March, May, ...
+        let feb = Tz::UTC.with_ymd_and_hms(2026, 2, 10, 0, 0, 0).unwrap();
+        assert_eq!(next(&when("* *-*/2-1 00:00:00", "UTC"), feb, false), utc(2026, 3, 1, 0, 0, 0));
+        // Days '*/2' -> 1, 3, 5, ...
+        let day2 = Tz::UTC.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        assert_eq!(next(&when("* *-*-*/2 00:00:00", "UTC"), day2, false), utc(2026, 1, 3, 0, 0, 0));
+    }
+
+    #[test]
+    fn when_smaller_fields_reset_when_a_bigger_one_advances() {
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 10, 30, 15).unwrap();
+        // Every minute of the 05:xx hour: next is 05:00:00 tomorrow, not 05:30
+        assert_eq!(next(&when("* *-*-* 05:*:00", "UTC"), now, false), utc(2026, 1, 2, 5, 0, 0));
+        // Every second during minute 45 of each hour
+        assert_eq!(next(&when("* *-*-* *:45:*", "UTC"), now, false), utc(2026, 1, 1, 10, 45, 0));
+        // Specific year in the future
+        assert_eq!(next(&when("* 2028-*-* *:*:*", "UTC"), now, false), utc(2028, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn when_year_in_the_past_never_runs() {
+        let now = Tz::UTC.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        assert!(next(&when("* 2025-*-* *:*:*", "UTC"), now, true) > now.with_timezone(&Utc));
+    }
+
+    // ── Misc ──
+
+    #[test]
+    fn duration_to_next_second_is_never_huge() {
+        let base = utc(2026, 1, 1, 0, 0, 0);
+        assert_eq!(Scheduler::duration_to_next_second(base), Duration::from_millis(1000));
+        assert_eq!(
+            Scheduler::duration_to_next_second(base + TimeDelta::milliseconds(250)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            Scheduler::duration_to_next_second(base + TimeDelta::milliseconds(999)),
+            Duration::from_millis(1)
+        );
+        // Leap second representation (nanos >= 1e9)
+        let leap = base.with_nanosecond(1_500_000_000).unwrap();
+        assert_eq!(Scheduler::duration_to_next_second(leap), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn task_with_reused_pid_is_not_considered_running() {
+        let mut t = every(60, false);
+        // PID 1 always exists
+        t.last_pid = Some(1);
+        assert!(!Scheduler::is_task_running(&t, &Vec::<String>::new()));
+        assert!(Scheduler::is_task_running(&t, &["t".to_string()]));
     }
 }

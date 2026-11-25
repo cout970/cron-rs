@@ -1,4 +1,4 @@
-use crate::alerts::{send_alert, Alert, AlertConfig, TaskExecutionDetails};
+use crate::alerts::{send_alerts, Alert, AlertConfig, TaskExecutionDetails};
 use crate::config::TaskConfig;
 use crate::sqlite_logger::{ExecutionAttempt, ExecutionFailure, ExecutionSuccess, SqliteLogger};
 use crate::utils::format_duration;
@@ -187,16 +187,7 @@ impl TaskExecutor {
             info!("Task '{}' completed successfully in {}", task.name, format_duration(duration));
             
             // Send success alerts
-            for alert in &self.alerts.on_success {
-                if let Err(e) = send_alert(alert, &details) {
-                    error!("Failed to send success alert for task '{}': {}", task.name, e);
-                }
-            }
-            for alert in &task.on_success {
-                if let Err(e) = send_alert(alert, &details) {
-                    error!("Failed to send task-specific success alert for task '{}': {}", task.name, e);
-                }
-            }
+            send_alerts(self.alerts.on_success.iter().chain(&task.on_success), &details).await;
 
             // Log success to SQLite
             if let Some(sqlite_logger) = &self.sqlite_logger {
@@ -218,16 +209,7 @@ impl TaskExecutor {
             error!("Task '{}' failed with exit code {}", task.name, exit_code);
             
             // Send failure alerts
-            for alert in &self.alerts.on_failure {
-                if let Err(e) = send_alert(alert, &details) {
-                    error!("Failed to send failure alert for task '{}': {}", task.name, e);
-                }
-            }
-            for alert in &task.on_failure {
-                if let Err(e) = send_alert(alert, &details) {
-                    error!("Failed to send task-specific failure alert for task '{}': {}", task.name, e);
-                }
-            }
+            send_alerts(self.alerts.on_failure.iter().chain(&task.on_failure), &details).await;
 
             // Log failure to SQLite
             if let Some(sqlite_logger) = &self.sqlite_logger {

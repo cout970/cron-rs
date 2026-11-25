@@ -48,11 +48,11 @@ tasks:
     when:
       # '*' means every value, '*' is the default value
       # Single value like 'Mon', '0', '2025' match the current date exactly
-      # Range like 'Mon-Fri', '0-23', '2023-2025' match the current date in the range, including the start and end values
+      # Range like 'Mon..Fri', '0..23', '2023..2025' match the current date in the range, including the start and end values
       # List like '[Mon, Tue]', '[0, 1, 2]', '[2023, 2024]' match the current date in the list
       # Ratios like '*/2', '*/5', '*/5+1' match the current date in the ratio, every 2 min, every 5 min, every 5 min starting from 1 (1, 6, 11, etc.)
 
-      # day_of_week: Mon, Tue, Wed, Thu, Fri, Sat, Sun
+      # day_of_week: Mon, Tue, Wed, Thu, Fri, Sat, Sun (or numbers like cron: 0 or 7 = Sun, 1 = Mon, ..., 6 = Sat)
       day_of_week: '*'
       # year: 2023, 2024, 2025, ...
       year: '*'

@@ -1,16 +1,20 @@
 use crate::utils::format_duration;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use log::{error, info};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Add;
-use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
+use tokio::process::Command;
+
+/// Max time an alert can take. Alerts run inside the scheduler's async runtime, an alert that
+/// never finishes (an SMTP server that doesn't answer, a command that hangs...) must not block it.
+pub const ALERT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AlertConfig {
@@ -63,6 +67,7 @@ pub enum Alert {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct TaskExecutionDetails {
     pub task_name: String,
     pub task_id: u32,
@@ -101,7 +106,50 @@ fn default_escape_webhook() -> EscapeStrategy {
     EscapeStrategy::Json
 }
 
-pub fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
+/// Sends all the alerts concurrently (each one limited by `ALERT_TIMEOUT`) and waits for them.
+/// Errors are logged, a slow or failing alert doesn't delay the others.
+pub async fn send_alerts<'a>(alerts: impl IntoIterator<Item = &'a Alert>, details: &TaskExecutionDetails) {
+    let details = std::sync::Arc::new(details.clone());
+    let mut set = tokio::task::JoinSet::new();
+
+    for alert in alerts {
+        let alert = alert.clone();
+        let details = details.clone();
+        set.spawn(async move {
+            if let Err(e) = send_alert(&alert, &details).await {
+                error!("Failed to send {} alert for task '{}': {}", alert_kind(&alert), details.task_name, e);
+            }
+        });
+    }
+
+    while let Some(result) = set.join_next().await {
+        if let Err(e) = result {
+            error!("Alert task for '{}' failed: {}", details.task_name, e);
+        }
+    }
+}
+
+/// Sends an alert, giving up after `ALERT_TIMEOUT`.
+pub async fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
+    send_alert_with_timeout(alert, details, ALERT_TIMEOUT).await
+}
+
+pub async fn send_alert_with_timeout(alert: &Alert, details: &TaskExecutionDetails, timeout: Duration) -> Result<()> {
+    match tokio::time::timeout(timeout, send_alert_inner(alert, details, timeout)).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("{} alert timed out after {}s", alert_kind(alert), timeout.as_secs_f32())),
+    }
+}
+
+fn alert_kind(alert: &Alert) -> &'static str {
+    match alert {
+        Alert::Email { .. } => "Email",
+        Alert::Cmd { .. } => "Cmd",
+        Alert::Webhook { .. } => "Webhook",
+    }
+}
+
+async fn send_alert_inner(alert: &Alert, details: &TaskExecutionDetails, timeout: Duration) -> Result<()> {
     match alert {
         Alert::Email {
             from,
@@ -131,27 +179,35 @@ pub fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
 
             let server = smtp_server.clone().unwrap_or_else(|| "localhost".to_string());
             let port = smtp_port.unwrap_or(25);
-            let username = smtp_username.clone().unwrap_or_default();
-            let password = smtp_password.clone().unwrap_or_default();
 
             let mut mailer = if server == "localhost" || port == 25 {
                 SmtpTransport::builder_dangerous(server).port(port)
             } else {
                 SmtpTransport::relay(&server)?.port(port)
             };
+            mailer = mailer.timeout(Some(timeout));
 
             if let (Some(username), Some(password)) = (smtp_username, smtp_password) {
                 mailer = mailer.credentials(Credentials::new(username.clone(), password.clone()));
             }
 
-            match mailer.build().send(&email) {
+            // lettre's SMTP transport is blocking, run it outside the async worker threads
+            let mailer = mailer.build();
+            let result = tokio::task::spawn_blocking(move || mailer.send(&email)).await?;
+            match result {
                 Ok(_) => info!("Email sent successfully"),
                 Err(e) => error!("Failed to send email: {}", e),
             }
         }
         Alert::Cmd { cmd, escape } => {
             let cmd = template_replace(cmd, details, escape);
-            let output = Command::new("/bin/sh").arg("-c").arg(&cmd).output()?;
+            let output = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&cmd)
+                // If the timeout expires the future is dropped, kill the command instead of leaving it running
+                .kill_on_drop(true)
+                .output()
+                .await?;
             if !output.status.success() {
                 error!(
                     "Failed to execute alert command: {}",
@@ -171,7 +227,7 @@ pub fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
                 .unwrap_or_else(|| "Task {{ task_name }} failed with exit code {{ exit_code }}".to_string());
             let body = template_replace(&body, details, escape);
 
-            let client = Client::new();
+            let client = Client::builder().timeout(timeout).build()?;
             let mut request = match method.as_deref() {
                 Some("GET") => client.get(url),
                 Some("POST") => client.post(url),
@@ -190,13 +246,14 @@ pub fn send_alert(alert: &Alert, details: &TaskExecutionDetails) -> Result<()> {
             }
             request = request.headers(header_map).body(body);
 
-            match request.send() {
+            match request.send().await {
                 Ok(response) => {
                     if !response.status().is_success() {
+                        let status = response.status();
                         error!(
                             "Webhook request failed with status: {}, '{}'",
-                            response.status(),
-                            response.text().unwrap_or_default()
+                            status,
+                            response.text().await.unwrap_or_default()
                         );
                     }
                 }
@@ -354,4 +411,94 @@ pub fn escape_shell_arg_string(s: &str) -> String {
 
     result.push('\'');
     result
+}
+
+#[cfg(test)]
+mod alert_runtime_tests {
+    use super::*;
+
+    fn details() -> TaskExecutionDetails {
+        TaskExecutionDetails {
+            task_name: "t".into(),
+            task_id: 0,
+            pid: 0,
+            exit_code: 1,
+            start_time: Utc::now(),
+            duration: Duration::ZERO,
+            error_message: String::new(),
+            debug_info: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn alert(yaml: &str) -> Alert {
+        serde_yml::from_str(yaml).unwrap()
+    }
+
+    // Used to panic: reqwest::blocking can't be used inside a tokio runtime
+    #[tokio::test(flavor = "multi_thread")]
+    async fn webhook_inside_runtime_does_not_panic() {
+        let a = alert("type: webhook\nurl: http://127.0.0.1:1/unreachable");
+        // Connection errors are logged, not returned
+        assert!(send_alert(&a, &details()).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn webhook_to_server_that_never_answers_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let a = alert(&format!("type: webhook\nurl: http://127.0.0.1:{}/hang", port));
+
+        let start = Instant::now();
+        let _ = send_alert_with_timeout(&a, &details(), Duration::from_millis(300)).await;
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(listener);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hanging_cmd_alert_times_out_and_is_killed() {
+        let marker = std::env::temp_dir().join(format!("cron-rs-alert-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let a = alert(&format!("type: cmd\ncmd: sleep 2; touch {}", marker.display()));
+
+        let start = Instant::now();
+        let result = send_alert_with_timeout(&a, &details(), Duration::from_millis(200)).await;
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // The command was killed, it never reaches the `touch`
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cmd_alert_runs() {
+        let marker = std::env::temp_dir().join(format!("cron-rs-alert-ok-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let a = alert(&format!("type: cmd\ncmd: touch {}", marker.display()));
+        assert!(send_alert(&a, &details()).await.is_ok());
+        assert!(marker.exists());
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alerts_are_sent_concurrently() {
+        let marker = std::env::temp_dir().join(format!("cron-rs-alert-concurrent-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let slow = alert("type: cmd\ncmd: sleep 1");
+        let fast = alert(&format!("type: cmd\ncmd: touch {}", marker.display()));
+
+        let start = Instant::now();
+        let alerts = vec![slow.clone(), slow, fast];
+        let send = tokio::spawn(async move { send_alerts(&alerts, &details()).await });
+
+        // The fast alert doesn't wait for the slow ones
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(marker.exists());
+        send.await.unwrap();
+        // Both slow ones ran in parallel
+        assert!(start.elapsed() < Duration::from_millis(1900));
+        let _ = std::fs::remove_file(&marker);
+    }
 }

@@ -9,7 +9,7 @@ pub mod validation;
 pub mod watchdog;
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::TimeZone;
+use chrono::{Datelike, NaiveDate, TimeZone};
 use chrono_tz::{Tz, UTC};
 use nom::branch::alt;
 use nom::bytes::complete::tag;
@@ -241,6 +241,22 @@ impl TimePattern {
     }
 }
 
+impl TimePattern {
+    /// Checks the date fields (year, month, day, day of week) against a local date.
+    /// Month and day are 1-based (January = 1, first day of the month = 1),
+    /// day of week follows cron: Sunday = 0 (or 7), Monday = 1, ..., Saturday = 6.
+    pub fn matches_date(&self, date: NaiveDate) -> bool {
+        self.year.matches_value(date.year().max(0) as u32)
+            && self.month.matches_one_based(date.month())
+            && self.day.matches_one_based(date.day())
+            && self.matches_day_of_week(date.weekday().num_days_from_sunday())
+    }
+
+    fn matches_day_of_week(&self, dow: u32) -> bool {
+        self.day_of_week.matches_value(dow) || (dow == 0 && self.day_of_week.matches_value(7))
+    }
+}
+
 impl TimePatternField {
     /// Checks if the field matches a given value
     pub fn matches_value(&self, value: u32) -> bool {
@@ -249,65 +265,22 @@ impl TimePatternField {
             TimePatternField::Value(v) => value == *v,
             TimePatternField::Range(start, end) => value >= *start && value <= *end,
             TimePatternField::List(values) => values.contains(&value),
-            TimePatternField::Ratio(divisor, offset) => value % divisor + *offset == 0,
-        }
-    }
-    
-    /// Returns a tuple with the next valid value and 1 if the value requires increasing the next number, 0 if it doesn't
-    pub fn get_next_valid_value(&self, the_value: u32, limit: u32) -> (u32, u32) {
-        let value = the_value % limit;
-        let overflows: u32 = if the_value >= limit { 1 } else { 0 };
-        match self {
-            TimePatternField::Any => (value, overflows),
-            TimePatternField::Value(v) => {
-                if value <= *v {
-                    (*v, overflows)
-                } else {
-                    (*v, 1)
-                }
-            }
-            TimePatternField::Range(start, end) => {
-                if value < *start {
-                    (*start, overflows)
-                } else if value > *end {
-                    (*start, 1)
-                } else {
-                    (value, overflows)
-                }
-            }
-            TimePatternField::List(values) => {
-                if let Some(next_value) = values.iter().find(|&&v| v >= value) {
-                    if value <= *next_value {
-                        (*next_value, overflows)
-                    } else {
-                        (*next_value, 1)
-                    }
-                } else {
-                    // If no value is found, return the first value in the list
-                    (*values.first().unwrap_or(&value), 1)
-                }
-            }
+            // '*/5+1' matches 1, 6, 11, ...
             TimePatternField::Ratio(divisor, offset) => {
-                let mut curr = value;
-                let mut rest = overflows;
-
-                // Do a full cycle to find the next valid value
-                for i in 0..limit {
-                    if curr % divisor + *offset == 0 {
-                        return (curr, rest);
-                    }
-                    if curr + 1 >= limit {
-                        rest = 1;
-                    }
-                    curr = (curr + 1) % limit;
-                }
-
-                // No value matches the pattern, return the current value
-                (value, rest)
+                *divisor != 0 && value >= *offset && (value - offset) % divisor == 0
             }
         }
     }
-    
+
+    /// Like `matches_value` for 1-based fields (day, month). Explicit values are 1-based,
+    /// ratios count from the first value: '*/2' matches days 1, 3, 5... and months Jan, Mar, May...
+    pub fn matches_one_based(&self, value: u32) -> bool {
+        match self {
+            TimePatternField::Ratio(..) => value >= 1 && self.matches_value(value - 1),
+            _ => self.matches_value(value),
+        }
+    }
+
     pub fn parse_exploded_field(
         config: &ExplodedTimePatternFieldConfig,
         allow_dow: bool,

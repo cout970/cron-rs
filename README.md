@@ -301,6 +301,15 @@ when: '[Mon,Tue] *-*/2-01..04 12:00:00'
 - `n..m`: Range (e.g., `1..5` for days 1 through 5, both included)
 - `*/n`: Every nth value (e.g., `*/2` for every other value)
 - `[a,b,c]`: List of values (e.g., `[Mon,Wed,Fri]` for those specific days)
+- `*/n+m`: Every nth value starting from m (e.g., `*/5+1` for minutes 1, 6, 11, ...)
+
+Months (`1`-`12`) and days (`1`-`31`) start at 1, ratios count from the first value: `*/2` matches
+days 1, 3, 5, ... and months January, March, May, ... Days of the week can be names (`Mon`..`Sun`) or
+numbers like in cron: `0` or `7` is Sunday, `1` is Monday, ..., `6` is Saturday.
+
+Daylight saving time changes are handled like cron: tasks scheduled in the skipped hour run right after
+the change (02:30 becomes 03:30), and in the repeated hour tasks with a fixed hour run once while tasks
+that run every hour also run during the repeated hour.
 
 You can combine these patterns for powerful scheduling flexibility.
 
